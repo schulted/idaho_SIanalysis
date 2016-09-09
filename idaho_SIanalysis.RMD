@@ -1,0 +1,222 @@
+---
+title: "Idaho Shape Complexity Analysis"
+author: "Darin Schulte"
+date: "September 9, 2016"
+output:
+  html_document: 
+    toc: true
+    toc_depth: 6
+---
+
+
+###Load Necessary Packages      
+ 
+```{r}
+# Spatial data and analysis packages
+library(rgdal)
+getGDALVersionInfo()
+library(gdalUtils)
+library(tools)
+library(raster)
+library(sp)
+library(shapefiles)
+library(reshape2)
+library(spatstat)
+library(maptools)
+library(cleangeo)
+library(rgeos)
+
+# Plotting packages
+library(ggplot2)
+library(grid)
+library(Rmisc)
+library(GGally)
+
+# General packages for data manipulation and statistics
+library(data.table)
+library(dtplyr)
+library(stats)
+library(plyr)
+library(car)
+library(lme4)
+library(nlme)
+library(MASS)
+library(bbmle)
+```   
+
+<br/>   
+
+-----------    
+
+
+## General notes   
+### Plot descriptions   
+Plots **Q1 - Q10** and **Q19 - Q26** were not grazed during the data collection period. These are the focus of this analysis. 
+
+## Set the working directory   
+```{r}
+# Set working directory
+setwd("C:\\Users\\darin\\Dropbox\\wd_R\\idaho_analysis\\working_data")
+getwd()
+```      
+
+
+## Create list of shapefiles   
+List of shapefiles contains only the **cover** shapefiles (i.e., the polygon files not the point files) and only those plots that were not grazed during the study period.   
+
+```{r, eval = FALSE}
+# Create list of file names (just the .shp file names)
+shpFiles <- list.files("./msData/shapefiles", pattern = glob2rx("*.shp"), full.names = TRUE)
+head(shpFiles)
+
+# Extract base names (i.e., file names without full paths)
+baseNames <- basename(shpFiles)
+head(baseNames)
+
+# Remove .shp extension to get just the plot name and year
+baseNames <- file_path_sans_ext(baseNames)
+#head(baseNames)
+# Split file names to get access to the plot name and type (cover vs density)
+plotNames <- strsplit(baseNames, '_', '\\.')
+length(plotNames)
+head(plotNames)
+
+plotsList <- list(NA, rep(length(plotNames)))
+for(i in 1:length(plotNames)) {
+    plotsList[i] <- plotNames[[i]][1]
+}
+plotsList <- unlist(plotsList)
+
+# Get subset of list containing only non-grazed plots (Q1 - Q10 & Q19 - Q26)
+u_g_plots <- c("Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7", "Q8", "Q9", "Q10", "Q19", "Q20", "Q21", "Q22", "Q23", "Q24", "Q25", "Q26")
+testList <-  plotsList %in% u_g_plots
+testList
+plotsList_ng <- shpFiles[testList==TRUE]
+plotsList_ng
+
+# Get a sublist of only cover (polygons) shapefiles (the density shapefiles are points not polygons)
+baseNames <- basename(plotsList_ng)
+baseNames <- file_path_sans_ext(baseNames)
+plotNames <- strsplit(baseNames, "_", "\\.")
+plotsList <- list(NA, rep(length(plotNames)))
+for (i in 1:length(plotNames)) {
+    plotsList[i] <- plotNames[[i]][3]
+}
+plotsList <- unlist(plotsList)
+u_g_type <- "C"
+testList <- plotsList %in% u_g_type
+testList
+plotsList_ng_C <- plotsList_ng[testList==TRUE]
+plotsNG <- plotsList_ng_C
+# Plot names used below in reassigning cleaned geometries to shapefiles
+cleanedNames <- basename(plotsNG)
+cleanedNames <- file_path_sans_ext(cleanedNames)
+cleanedNames <- paste("./msData/cleanedShapeFiles/", cleanedNames, "_cleaned", sep="")
+
+# Remove temp variables
+#rm(plotsList_ng_C, plotsList_ng)
+```      
+
+<br/>   
+ 
+---------------------   
+
+## Shape index processing   
+
+For each shapefile:   
+
+* Clean the geometries for all polygons    
+* Exclude the polygons that touch the bounding box for that plot    
+* Calculate the Shape Complexity Index for each polygon (non-square representation)   
+* Append results to dataframe     
+
+
+### Cleaning the geometries   
+**NOTE**: Q2_36_C_cleaned required manual editing of one of the polygons in QGIS. After editing, the shapefile resulting from the following code chunk was replaced with the manually edited version.   
+```{r}
+# Cleaning the geometries
+######################################
+# NOTE: This only needs to be run once
+######################################
+#dir.create("./msData/cleanedShapeFiles")
+
+# Define a function to clean the geometries of the shapefiles and write them out to new shapefiles
+cleanGeoms <- function(polygonFileList) {
+    for(i in 1:length(polygonFileList)) {
+        polyFile <- readShapePoly(polygonFileList[[i]])
+        # Inspect the spatial objects to detect potential geometry issues and make a summary
+        #   source: https://cran.r-project.org/web/packages/cleangeo/vignettes/quickstart.html
+        report <- clgeo_CollectionReport(polyFile)
+
+        # Clean the spatial objects (takes about 1 minute on poly_unun_7_2002 with 400+ polygons)
+        polyFile.clean <- clgeo_Clean(polyFile, strategy = "BUFFER") #Default strategy "POLYGONIZE" errors out
+
+        polyFile.clean@data <- polyFile.clean@data[, c(1, 2)] #Only need "2", but spdf won't allow you to only choose one column
+        # Write out to a new shapefile (that represents the cleaned geometry)
+        writeSpatialShape(polyFile.clean, cleanedNames[i])
+        }
+    }
+#length(cleanedNames)
+cleanGeoms(plotsNG)
+```   
+
+### Exclude polygons touching bounding box   
+```{r}
+######################################
+# NOTE: This only needs to be run once
+######################################
+#dir.create("./msData/nonEdgePolys")
+
+# Create list of file names of 'cleaned' polygons(just the .shp file names)
+clnShpFiles <- list.files("./msData/cleanedShapeFiles", pattern = glob2rx("*.shp"), full.names = TRUE)
+
+# Define a function to test for intersection with bounding box
+removeEdgePolys <- function(shapeFile) {
+    shpToSPDF <- readShapePoly(shapeFile)
+    
+    # Create SpatialPolygons object out of the bounding box of the plot
+    bboxPolygon <- as(extent(shpToSPDF), 'SpatialPolygons')
+
+    # Test for intersection with bounding box 
+    edgePolysTest <- gContainsProperly(bboxPolygon, shpToSPDF, byid = TRUE)
+    
+    # Get only those polygons that do not intersect bbox and save to shapefile
+    spdf_edgeRmv <- shpToSPDF[c(edgePolysTest), ]
+    shpBaseName <- basename(shapeFile)
+    shpBaseName <- file_path_sans_ext(shpBaseName)
+    edgeRmvNames <- paste("./msData/nonEdgePolys/", shpBaseName, "_edgeRmv", sep="")
+    writeSpatialShape(spdf_edgeRmv, edgeRmvNames)
+}
+
+# Run function on all plots
+lapply(clnShpFiles, function(x) {removeEdgePolys(x)})
+```   
+
+### Calculating Shape Complexity   
+```{r}
+
+#################################################################
+#TODO: Make edits so that necessary variables are retained for later processes 
+# even though the processing code chunks that generate the new shapefiles will not be run
+####################################################################
+
+# Create an empty dataframe to store results
+shapeComp <- data.frame()
+#############################################
+# Test on one shapefile example case
+shpToSPDF <- readShapePoly("C:\\Users\\Darin\\Documents\\rWorkingDir\\projectFiles\\idahoSpatialData\\working_data\\msData\\nonEdgePolys\\Q1_32_C_cleaned_edgeRmv.shp")
+
+# Calculate the area of each polygon
+shpToSPDF$area <- gArea(shpToSPDF, byid = TRUE)
+
+# Calculate perimeter of each polygon
+
+
+# Define a function for calculating the Shape Complexity Index
+sci <- function(shapes) {
+    shpToSPDF <- readShapePoly(shapes)
+    
+    
+    
+}
+```   
