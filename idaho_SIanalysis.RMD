@@ -148,7 +148,7 @@ cleanGeoms <- function(polygonFileList) {
         #   source: https://cran.r-project.org/web/packages/cleangeo/vignettes/quickstart.html
         report <- clgeo_CollectionReport(polyFile)
 
-        # Clean the spatial objects (takes about 1 minute on poly_unun_7_2002 with 400+ polygons)
+        # Clean the spatial objects 
         polyFile.clean <- clgeo_Clean(polyFile, strategy = "BUFFER") #Default strategy "POLYGONIZE" errors out
 
         polyFile.clean@data <- polyFile.clean@data[, c(1, 2)] #Only need "2", but spdf won't allow you to only choose one column
@@ -200,23 +200,37 @@ lapply(clnShpFiles, function(x) {removeEdgePolys(x)})
 # even though the processing code chunks that generate the new shapefiles will not be run
 ####################################################################
 
-# Create an empty dataframe to store results
-shapeComp <- data.frame()
-#############################################
-# Test on one shapefile example case
-shpToSPDF <- readShapePoly("C:\\Users\\Darin\\Documents\\rWorkingDir\\projectFiles\\idahoSpatialData\\working_data\\msData\\nonEdgePolys\\Q1_32_C_cleaned_edgeRmv.shp")
+#dir.create("./msData/sciPolys")
 
-# Calculate the area of each polygon
-shpToSPDF$area <- gArea(shpToSPDF, byid = TRUE)
+# Create list of file names of 'non-edge' polygons (created in previous code chunk)
+noEdgeShpFiles <- list.files("./msData/nonEdgePolys", pattern = glob2rx("*.shp"), full.names = TRUE)
 
-# Calculate perimeter of each polygon
-
-
-# Define a function for calculating the Shape Complexity Index
-sci <- function(shapes) {
+# Define function to calculate area, perimeter and shape complexity index for all polygons
+shpCompInd <- function(shapes) {
     shpToSPDF <- readShapePoly(shapes)
+    shpBaseName <- basename(shapes)
+    shpBaseName <- file_path_sans_ext(shpBaseName)
+    sciNames <- paste("./msData/sciPolys/", shpBaseName, "_sci", sep="")
+    # Keep only ID and species name @data fields
+    shpToSPDF@data <- shpToSPDF@data[, c(1, 4)]
     
+    # Calculate area of each polygon and append 'area' column to @data
+    shpToSPDF$area <- gArea(shpToSPDF, byid = TRUE)
+    # Calculate perimeter of each polygon and append 'perimeter' column to @data
+    shpToSPDF$perimeter <- gLength(shpToSPDF, byid = TRUE)
     
+    # Calculate shape complexity index and append 'sci' column to @data
+    shpToSPDF$sci <- shpToSPDF$perimeter/(2*pi*(sqrt(shpToSPDF$area/pi)))
     
+    # Write out to shapefile overwriting previous file
+    writeSpatialShape(shpToSPDF, sciNames)
 }
+
+# Calculate shape complexity for all polygons in list of spdfs
+lapply(noEdgeShpFiles, function(x) {shpCompInd(x)})
+
+
+# T-test 
+t.test(shpToSPDF$sci, circles)
+
 ```   
