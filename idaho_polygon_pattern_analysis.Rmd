@@ -1,0 +1,408 @@
+---
+title: "idaho_polygon_pattern_analysis"
+author: "Darin Schulte"
+date: "September 12, 2016"
+output:
+  html_document: 
+    toc: true
+    toc_depth: 6
+---
+
+### Description   
+Data processing associated with investigating the application of point pattern analysis techniques on polygon data. Work is divided into three main components:   
+
+**Component**   |       **Purpose**     
+------------|---------------
+PPA         |   Traditional Point Pattern Analysis
+Polygon PPA |   Polygon based pair-correlation analysis    
+Aerial Polygon PPA   |   Polygon based analysis accounting for area of neighbors   
+
+### General terms and descriptions   
+**Concept**   |       **Description**     
+------------|---------------
+Pair Correlation Function $g(r)$       |   Based on object to object distances and describes the aggregation and regularity at a given radius $r$. A completely random pattern: $g(r) = 1$. Clustering: $g(r) > 1$. Regularity: $g(r) < 1$. $g(r)$ can take any value between $0$ and $infty$ and generally approaches $1$ as $r$ increases.
+Polygon PPA |   Polygon based pair-correlation analysis    
+Aerial Polygon PPA   |   Polygon based analysis accounting for area of neighbors      
+
+
+###Load Necessary Packages      
+```{r}
+# Spatial data and analysis packages
+library(rgdal)
+getGDALVersionInfo()
+library(gdalUtils)
+library(tools)
+library(raster)
+library(sp)
+library(shapefiles)
+library(reshape2)
+library(spatstat)
+library(maptools)
+library(rgeos)
+
+# Plotting packages
+library(ggplot2)
+library(grid)
+library(Rmisc)
+library(GGally)
+
+# General packages for data manipulation and statistics
+library(data.table)
+library(dplyr)
+#library(stats)
+library(plyr)
+library(cleangeo)
+#library(car)
+#library(lme4)
+#library(nlme)
+```   
+
+<br/>   
+
+-----------    
+
+### Set working directory    
+Files were created in the *idaho_SIanalysis.RMD* file.   
+```{r}
+setwd("C:\\Users\\darin\\Dropbox\\wd_R\\idaho_analysis\\working_data")
+getwd()
+```   
+
+
+### Read in shapefile    
+```{r}
+# Read in the files
+polyFile <- readShapePoly("./msData/cleanedShapeFiles/Q1_32_C_cleaned.shp")
+# Remove duplicate SP_ID column from @data
+polyFile@data <- polyFile@data[, c(1, 3)]
+```  
+
+
+## Polygon-based pattern analysis     
+
+### Identify polygons that intersect the edge of the plot   
+The following is working with code from Ben Marwick as a base. See _https://github.com/benmarwick/Rocks-and-burials-at-Madjebebe/blob/master/code/Rocks-and-burials-at-MJB.Rmd_ for more details.      
+
+Create a polygon of the bounding box for the entire plot   
+```{r}
+# Create a polygon of the bounding box of the entire plot
+bboxPolygon <- as(extent(polyFile), 'SpatialPolygons')
+```      
+
+Convert the bounding box to a `SpatialLines` object   
+```{r}
+# Convert bboxPolys to a SpatialLines object 
+bboxAsLines <- as(bboxPolygon, "SpatialLines")
+bbLinesList <- unlist(bboxAsLines@lines[[1]])
+lineNames <- c("line1", "line2", "line3", "line4")
+# Create SpatialLines objects for the bbox lines
+bbLines_1 <- SpatialLines(list(Lines(list(Line(bbLinesList@Lines[[1]]@coords[1:2, ])), ID = lineNames[[1]])))
+bbLines_2 <- SpatialLines(list(Lines(list(Line(bbLinesList@Lines[[1]]@coords[2:3, ])), ID = lineNames[[2]])))
+bbLines_3 <- SpatialLines(list(Lines(list(Line(bbLinesList@Lines[[1]]@coords[3:4, ])), ID = lineNames[[3]])))
+bbLines_4 <- SpatialLines(list(Lines(list(Line(bbLinesList@Lines[[1]]@coords[4:5, ])), ID = lineNames[[4]])))
+# Join these into a single SpatialLines object
+bbLines <- bbLines_1
+bbLines <- spRbind(bbLines, bbLines_2)
+bbLines <- spRbind(bbLines, bbLines_3)
+bbLines <- spRbind(bbLines, bbLines_4)
+# Clean up old objects
+rm(bbLines_1, bbLines_2, bbLines_3, bbLines_4, lineNames)
+```   
+
+Create a list that stores the index of the `bbLines` object where an overlap with a given polygon occurs   
+```{r}
+# Get list of the bounding box edge index of overlap
+edgePolys <- sp::over(polyFile, bbLines, byid = TRUE)
+```   
+
+
+### Generate random points within the bounding box.     
+**Note** the number of points returned is approximately the value given. Better to generate extra points.    
+```{r}
+# Get the number of polygons in the shapefile
+numPoints <- length(polyFile) 
+rndPoints <- spsample(bboxPolygon, numPoints, type = "random")
+#rndPoints <- spsample(bboxPolygon, 200, type = "random")
+#plot(rndPoints)
+#plot(bboxPolygon, add = TRUE, border = "lightsteelblue4")
+```        
+
+### Randomly rotating and moving the polygons   
+
+Defines the process by which each plant polygon is randomly rotated and shifted to a point from the `rndPoints` object, or, if it touches the bounding box of the plot, it is rotated by a multiple of 90 degrees and assigned to a random location along one of the other edges. This creates a shapefile of the randomly shuffled polygons within the bounding box. This is repeated to generate a user defined number of shapefiles.     
+
+Code originally based on _https://github.com/benmarwick/Rocks-and-burials-at-Madjebebe/blob/master/code/Rocks-and-burials-at-MJB.Rmd_, however, recent updates to several packages (most notably the raster package) made the process much more streamlined.   
+```{r}
+# Create list of polygons sorted by size including whether or not they intersect the bounding box (they will be placed largest to smallest which may not be necessary if overlap is allowed)
+polys_sorted <- data.frame(id = integer(), intersectEdge = integer(), area = double()) 
+for (areas in 1:length(polyFile)) {
+    polys_sorted[areas, 1] <- polyFile@polygons[[areas]]@ID
+    polys_sorted[areas, 2] <- edgePolys[[areas]]
+    # May be better to use gArea, but since the exact area is not really the focus, it may not be necessary.
+    polys_sorted[areas, 3] <- polyFile@polygons[[areas]]@area
+}
+# Sort by descending area
+polys_sorted <- polys_sorted[order(-polys_sorted[,3]),]
+
+# The row names correspond to the polygon index (ID's start at 0 so row numbers are ID + 1)
+poly_index <- row.names(polys_sorted)
+poly_index <- as.numeric(poly_index)
+
+#poly_index <- polys_sorted[, 1]
+#poly_index <- as.numeric(poly_index)
+# Create list to store the output from each full run as a list of SpatialPolygonsDataFrames
+# The value supplied to 'length' will determine the number of random patterns generated
+#   Perry et al 2006 pg 62 note Diggle 2003 in saying 500 replicats seems appropriate for (alpha = 0.01) in
+#   tests of statistical significance
+simsList <- vector("list", length = 20)   # Change back to 500
+
+# Create a list of random angles (multiple of 90 degrees) by which to rotate the polygon (around its centroid).
+# Here, a list of length(number of polygons in the dataset) is created for the hypothetical case in which all polygons
+#   are touching an edge. This is never the case, but it makes sure that enough numbers are generated so that indexing 
+#   by 'plant' can be used to get the random rotation angle.
+# NOTE: rotates clockwise if 'by' is positive
+#edgePolyRotAngle <- sample(seq(0, 270, by = 90), size = length(polyFile), replace = TRUE)
+
+
+# The same process but for non-edge polygons. This creates a list of random angles from 0 to 359 of length(number of 
+#   polygons in the dataset) in the event that no polygons are touching an edge
+#rotateAngle <- sample(seq(0, 359, by = 1), size = length(polyFile), replace = TRUE)
+
+# Define an empty vector of length 2 to store the centroid coordinates for a given polygon
+centCoords <- vector(mode = "double", length = 2)
+# Function to calculate the centroid coordinates for a given polygon
+getCentCoords <- function(plantMoving) {
+    plantCentCoords <- slot(slot(slot(plantMoving, "polygons")[[1]], "Polygons")[[1]], "labpt")
+    return(plantCentCoords)
+}
+
+# Define empty vector of length 2 to store the random point coordinates which the plant will move to 
+rn <- vector(mode = "double", length = 2)
+
+# Define a list of one element (a vector of length 2) for storing offset values
+offsetValue <- list(vector(mode = "double", length = 2))
+
+# Define a function for calculating the offset values
+getOffsetVal <- function(coordVect, randomPoint) {
+    o_s_val <- coordVect - randomPoint
+    o_s_val <- list(-o_s_val)
+    return(o_s_val)
+}
+
+# Create an empty list to store results of checking for overlap
+# NOTE: Not run in the case where overlap is allowed
+#overlapCheck = list()
+
+# Create an empty vector of length 1 to hold boolean value for crosses with other polygons
+# NOTE: Not run in the case where overlap is allowed
+#noCrosses <- vector(mode = "logical", length = 1)
+
+for (i in 1:length(simsList)) {
+    # Track number of attempts to place a polygon (breaks at 1000 tries)
+    repTracker <- 1
+    repMax <- 1000
+    # Variable for query index
+    plant <- 1
+    plantMax <- length(poly_index) + 1
+
+    repeat {
+        # Get id of plants from the sorted list
+        plantToMoveID <- poly_index[plant]  
+        #plantToMoveID <- poly_index[1]
+        #poly_index[86]
+        #plot(polyFile[191, ])
+        #polyFile@polygons[[86]]@ID
+        # Select plant to rotate and move
+        plantToMove <- polyFile[plantToMoveID, ]
+        #polyFile[114, ]
+
+        # If the polygon is touching the bounding box,
+        #   1) rotate it by a multiple of 90 degrees, 
+        #   2) find the edge it intersects with, and 
+        #   3) move to a random position on the (different) appropriate bounding box edge
+        if (!is.na(polys_sorted[plant, 2])) {
+            # get the coordinates of the labpt, labpt, bbox also (centroid coords and bounding box)
+            centCoords <- getCentCoords(plantToMove)
+
+            # NOTE: Moved before the for loop to try and increase speed
+            # Get a random angle (multiple of 90 degrees) by which to rotate the polygon (around its center)
+            # NOTE: rotates clockwise if 'by' is positive
+            edgePolyRotAngle <- sample(seq(0, 270, by = 90), size = 1)   
+            
+            # Rotate the polygon
+            plantToMove <- elide(plantToMove, rotate = edgePolyRotAngle, center = centCoords)
+            
+            # Get the coordinates for plantToMove bbox (after rotation)
+            plantToMoveBBox <- plantToMove@bbox
+            
+            # Get the dimensions of the bbox (after rotation)
+            plantToMoveBBoxWidth <- abs(plantToMoveBBox[1,1] - plantToMoveBBox[1,2])  # in the x dimension
+            plantToMoveBBoxHeight <- abs(plantToMoveBBox[2,1] - plantToMoveBBox[2,2]) # in the y dimension
+            
+            # Get the shortest distance between the plantToMoveBBox and all edges
+            moveDistance <- gDistance(plantToMove, bbLines, byid = TRUE)
+
+            # Generate random value to assign to a point coordinate along an edge depending on the size of the polygon
+            randXOffset <- runif(1, (0.5 * plantToMoveBBoxWidth), (1 - 0.5 * plantToMoveBBoxWidth))
+            randYOffset <- runif(1, (0.5 * plantToMoveBBoxHeight), (1 - 0.5 * plantToMoveBBoxHeight))
+       
+            # Move the polygon to the appropriate edge depending on its rotation
+            if (polys_sorted[plant, 2] == 1) { # If polygon is initially touching the first side
+                if (edgePolyRotAngle == 0) {
+                    offsetCoord_x <- 0.0
+                    offsetCoord_y <- -(centCoords[2] - randYOffset)
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                    #gContains(bboxPolygon, plantMoved) == TRUE
+                } else if (edgePolyRotAngle == 90) {
+                    offsetCoord_x <- -(centCoords[1] - randXOffset)
+                    offsetCoord_y <- moveDistance[2]
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 180) {
+                    offsetCoord_x <- moveDistance[3]
+                    offsetCoord_y <- -(centCoords[2] - randYOffset)
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 270) {
+                    offsetCoord_x <- -(centCoords[1] - randXOffset)
+                    offsetCoord_y <- -(moveDistance[4])
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                }
+            } else if (polys_sorted[plant, 2] == 2) { # If polygon is initially touching the 2nd side
+                if (edgePolyRotAngle == 0) {
+                    offsetCoord_x <- -(centCoords[1] - randXOffset)
+                    offsetCoord_y <- 0.0
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 90) {
+                    offsetCoord_x <- moveDistance[3]
+                    offsetCoord_y <- -(centCoords[2] - randYOffset)
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 180) {
+                    offsetCoord_x <- -(centCoords[1] - randXOffset)
+                    offsetCoord_y <- -(moveDistance[4])
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 270) {
+                    offsetCoord_x <- -(moveDistance[1])
+                    offsetCoord_y <- -(centCoords[2] - randYOffset)
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                }
+            } else if (polys_sorted[plant, 2] == 3) { # If polygon is initially touching the 3rd side
+                if (edgePolyRotAngle == 0) {
+                    offsetCoord_x <- 0.0
+                    offsetCoord_y <- -(centCoords[2] - randYOffset)
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 90) {
+                    offsetCoord_x <- -(centCoords[1] - randXOffset)
+                    offsetCoord_y <- -(moveDistance[4])
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 180) {
+                    offsetCoord_x <- -(moveDistance[1])
+                    offsetCoord_y <- -(centCoords[2] - randYOffset)
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 270) {
+                    offsetCoord_x <- -(centCoords[1] - randXOffset)
+                    offsetCoord_y <- moveDistance[2]
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                }
+            } else if (polys_sorted[plant, 2] == 4) { # If polygon is initially touching the 4th side
+                if (edgePolyRotAngle == 0) {
+                    offsetCoord_x <- -(centCoords[1] - randXOffset)
+                    offsetCoord_y <- 0.0
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 90) {
+                    offsetCoord_x <- -(moveDistance[1])
+                    offsetCoord_y <- -(centCoords[2] - randYOffset)
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 180) {
+                    offsetCoord_x <- -(centCoords[1] - randXOffset)
+                    offsetCoord_y <- moveDistance[2]
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 270) {
+                    offsetCoord_x <- moveDistance[3]
+                    offsetCoord_y <- -(centCoords[2] - randYOffset)
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                }
+            }
+        } else {
+            # get the coordinates of the labpt, labpt, bbox also (centroid coords and bounding box)
+            centCoords <- getCentCoords(plantToMove)
+            
+            # rotate the plant by a random angle
+            rotateAngle <- sample(seq(0, 359, by = 1), size = 1)
+            plantToMove <- elide(plantToMove, rotate = rotateAngle, center = centCoords) # NOTE: rotates clockwise if 'by' is positive
+            
+            # get a random point in the overall bounding box to move to
+            samplePoint <- sample(rndPoints, size = 1, replace = FALSE)
+            rn <- unname(samplePoint@coords)
+            #rn <- unname(rndPoints@coords[sample(1:length(rndPoints), 1),])
+            
+            # shift all vertices coordinates
+            offsetValue <- getOffsetVal(centCoords, rn)
+
+            # shift the spatialPolygons object
+            plantMoved <- elide(plantToMove, shift = c(offsetValue[[1]][1], offsetValue[[1]][2]))
+        }
+        
+        # Test to see whether the shifted polygon is within the plot bounding box (allowing for intersection)
+        if (gContains(bboxPolygon, plantMoved) == TRUE) {
+            if (plant == 1) {
+                plants_rnd <- plantMoved
+                plant <- plant + 1
+                #cat('\n', 'Moving on to plant ', plant)
+                #plot(plants_rnd)
+            } else {
+                # Check to see whether it overlaps with any other polygons
+                #overlapCheck <- sp::over(plantMoved, plants_rnd, returnList = TRUE)
+                #noCrosses <- (nrow(overlapCheck[[1]]) == 0) || is.null(nrow(overlapCheck[[1]]))
+
+                #if (noCrosses == TRUE) {
+                    # Merge this SPDF object with plants_rnd
+                    plants_rnd <- rbind(plants_rnd, plantMoved)
+                    plant <- plant + 1
+                    #cat('\n', 'Moving on to plant ', plant)
+                    #plot(plants_rnd)
+                #}
+            }
+        } else {
+            plant <- plant
+            #cat('\n', "Failed try. Staying at plant ", plant)
+            repTracker <- repTracker + 1
+            #cat('\n', 'Attempt number ', repTracker)
+        }
+        
+        # Check for number of tries
+        if (repTracker == repMax) {
+            cat('\n', 'Max reps reached. Exiting this attempt.')
+            break
+        }
+        if (plant == plantMax) {
+            #cat('\n', 'That should be all of the plants')
+            cat('\n', "#######  COMPLETING ROUND ###############", i)
+            simsList[[i]] <- plants_rnd
+            break
+        }
+    }  # End of repeat
+    
+}  # End of for loop
+
+plot(simsList[[1]])
+plot(simsList[[16]])
+plot(bboxPolygon, add = TRUE)
+
+# Verify that each has the correct number of polygons
+testLength <- lapply(simsList, function(x) {length(x)})
+#lapply(simsList, function(x) {length(x) == testLength})
+```     
+
+
+```{r}
+# Buffer testing
+plotTest <- simsList[[1]]
+plotTest
+buffTest <- gBuffer(plotTest, width = 0.001, byid = TRUE)
+plot(buffTest)
+plot(plotTest)
+
+### NOTE FOR FUTRE USE: The following returns the shortest distance from a polygon edge to a bounding box edge
+gDistance(bboxAsLines, plantToMove)
+```   
+
+
