@@ -154,7 +154,7 @@ poly_index <- as.numeric(poly_index)
 # The value supplied to 'length' will determine the number of random patterns generated
 #   Perry et al 2006 pg 62 note Diggle 2003 in saying 500 replicats seems appropriate for (alpha = 0.01) in
 #   tests of statistical significance
-simsList <- vector("list", length = 20)   # Change back to 500
+simsList <- vector("list", length = 2)   # Change back to 500
 
 # Create a list of random angles (multiple of 90 degrees) by which to rotate the polygon (around its centroid).
 # Here, a list of length(number of polygons in the dataset) is created for the hypothetical case in which all polygons
@@ -384,7 +384,7 @@ for (i in 1:length(simsList)) {
 }  # End of for loop
 
 plot(simsList[[1]])
-plot(simsList[[16]])
+plot(simsList[[2]])
 plot(bboxPolygon, add = TRUE)
 
 # Verify that each has the correct number of polygons
@@ -395,11 +395,58 @@ testLength <- lapply(simsList, function(x) {length(x)})
 
 ```{r}
 # Buffer testing
-plotTest <- simsList[[1]]
-plotTest
-buffTest <- gBuffer(plotTest, width = 0.001, byid = TRUE)
-plot(buffTest)
-plot(plotTest)
+plotTest <- readOGR("./msData/cleanedShapeFiles/Q1_32_C_cleaned.shp", layer = "Q1_32_C_cleaned")
+plotTest <- simsList[[2]]
+# Get the bounding box for the plot
+bboxPolygon <- as(extent(plotTest), 'SpatialPolygons')
+plot(bboxPolygon)
+# plotTest <- simsList[[2]]
+plotTest <- plotTest[c(100, 105), ]
+plot(plotTest, add = TRUE)
+plantID <- factor(row.names(plotTest))
+polyData <- plotTest@data
+summary(polyData)
+
+# Buffer each polygon
+buffTest <- gBuffer(plotTest, width = 0.01, byid = TRUE)
+row.names(buffTest)
+plot(buffTest, add = TRUE)
+
+# Clip buffers to the bounding box of the plot
+buffClipped <- gIntersection(bboxPolygon, buffTest, byid = TRUE)
+plot(buffClipped)
+
+# Get list of polygons
+listOfPolys <- lapply(slot(buffClipped, "polygons"), function(x) SpatialPolygons(list(x)))
+# Get character list of polygon IDs
+polyIDs <- sapply(listOfPolys, function(x) slot(slot(x, "polygons")[[1]], "ID"))
+# names(listOfPolys) <- polyIDs
+# Test to see if they are the same length
+length(unique(polyIDs)) == length(listOfPolys)
+
+# Get buffer rings
+diffTest <- lapply(1:length(buffClipped), function(row) gDifference(buffClipped[row, ], plotTest[row, ]))
+#plot(diffTest[[1]], col = "skyblue")
+
+# Merge the @data to get a SpatialPolygonsDataFrame object
+joined <- SpatialPolygons(lapply(1:length(diffTest), function(x) {
+    Pol <- slot(diffTest[[x]], "polygons")[[1]]
+    slot(Pol, "ID") <- polyIDs[x]
+    Pol
+}))
+plot(joined, col = "skyblue")
+joinedSPDF <- SpatialPolygonsDataFrame(Sr = joined, data = polyData, FALSE)
+joinedSPDF@data
+plot(joinedSPDF, col = "skyblue")
+
+intersectTest <- raster::intersect(joinedSPDF, plotTest)
+plot(intersectTest)
+intersectTest[1, ]
+
+# Calculate proportion of overlapping buffers relative to total buffer area
+overlapProp <- (gArea(intersectTest) / gArea(joinedSPDF))  
+
+
 
 ### NOTE FOR FUTRE USE: The following returns the shortest distance from a polygon edge to a bounding box edge
 gDistance(bboxAsLines, plantToMove)
