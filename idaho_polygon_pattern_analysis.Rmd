@@ -154,7 +154,7 @@ poly_index <- as.numeric(poly_index)
 # The value supplied to 'length' will determine the number of random patterns generated
 #   Perry et al 2006 pg 62 note Diggle 2003 in saying 500 replicats seems appropriate for (alpha = 0.01) in
 #   tests of statistical significance
-simsList <- vector("list", length = 2)   # Change back to 500
+simsList <- vector("list", length = 500)   # Change back to 500
 
 # Create a list of random angles (multiple of 90 degrees) by which to rotate the polygon (around its centroid).
 # Here, a list of length(number of polygons in the dataset) is created for the hypothetical case in which all polygons
@@ -383,68 +383,305 @@ for (i in 1:length(simsList)) {
     
 }  # End of for loop
 
-plot(simsList[[1]])
-plot(simsList[[2]])
-plot(bboxPolygon, add = TRUE)
+plot(simsList[[100]])
+plot(simsList[[250]])
+#plot(bboxPolygon, add = TRUE)
 
 # Verify that each has the correct number of polygons
 testLength <- lapply(simsList, function(x) {length(x)})
 #lapply(simsList, function(x) {length(x) == testLength})
+
+#___________________________________________________________________________
+# Write to file
+# Save simsList as an RData file for loading in the future
+# saveRDS(simsList, "C:\\Users\\Darin\\Desktop\\simsList_unun_11_1999.RDS")
+saveRDS(simsList, "./msData/Q1_32_C_simsList.RDS")
 ```     
 
 
+## Buffering and overlap calculations   
+
 ```{r}
-# Buffer testing
+# Read in the simsList list of SPDFs (created in the previous code chunk)
+simsList <- readRDS("./msData/Q1_32_C_simsList.RDS")
+
+# Read in the original shapefile (for which simsList patterns were generated)
 plotTest <- readOGR("./msData/cleanedShapeFiles/Q1_32_C_cleaned.shp", layer = "Q1_32_C_cleaned")
-plotTest <- simsList[[2]]
-# Get the bounding box for the plot
-bboxPolygon <- as(extent(plotTest), 'SpatialPolygons')
-plot(bboxPolygon)
+plot(plotTest)
+
+# Append the SPDF for the original shapefile to simsList as the last element
+simsList[[501]] <- plotTest
+
+# Define function for calculating initial overlap area (before buffering)
+preBufferOverlap <- function(inputSPDF) {
+    overlapTest <- gOverlaps(inputSPDF, byid = TRUE, returnDense = FALSE)
+    containsTest <- gContainsProperly(inputSPDF, byid = TRUE, returnDense =FALSE)
+
+    overlapAreas <- vector(mode = "list", length = length(inputSPDF))
+    for (x in seq(along=overlapTest)) {
+        if (!is.null(overlapTest[[x]])) {
+            gi <- gIntersection(inputSPDF[overlapTest[[x]], ], inputSPDF[x, ])
+            overlapAreas[x] <- ifelse(is.null(gi), 0, gArea(gi))
+        }
+    }
+    
+    containsAreas <- vector(mode = "list", length = length(inputSPDF))
+    for (x in seq(along=containsTest)) {
+        if (!is.null(containsTest[[x]])) {
+            gi <- gIntersection(inputSPDF[containsTest[[x]], ], inputSPDF[x, ])
+            containsAreas[x] <- ifelse(is.null(gi), 0, gArea(gi))
+        }
+    }
+    
+    overSum <- sum(unlist(overlapAreas))
+    containSum <- sum(unlist(containsAreas))
+    
+    ocSum <- overSum + containSum
+    # Return ocSum
+    ocSum
+}
+
+# Run preBufferOverlap and store results in list
+over_con_sum <- lapply(1:length(simsList), function(x) {
+    inputPolys <- simsList[[x]]
+    preBufferOverlap(inputPolys)
+})
+
+#___________________________________________________________
+# Buffer testing
+# Buffer testing requires shapefiles to be read in with readOGR to create inner buffers. Write simsList to shapefiles and read in again with readOGR.
+#dir.create("./msData/simsLists")
+#dir.create("./msData/simsLists/Q1_32_C_simsList")
+# Create list of file names of 'cleaned' polygons(just the .shp file names)
+clnShpFiles <- list.files("./msData/cleanedShapeFiles", pattern = glob2rx("*.shp"), full.names = TRUE)
+# Get only those names of plots that were simulated in simsList
+simFile <- clnShpFiles[[1]]
+simBaseName <- basename(simFile)
+simBaseName <- file_path_sans_ext(simBaseName)
+simIndex <- seq(from = 1, to = length(simsList), by = 1)
+simNames <- lapply(simIndex, function(x) paste("./msData/simsLists/Q1_32_C_simsList/", simBaseName, "_sim_", simIndex[x], sep=""))
+writeSpatialShape(spdf_edgeRmv, edgeRmvNames)
+lapply(1:length(simsList), function(x) {
+    shpToWrite <- simsList[[x]]
+    shpToWriteName <- simNames[[x]]
+    writeSpatialShape(shpToWrite, shpToWriteName)
+})
+# Clean up environment variables
+# rm(clnShpFiles, simFile, simIndex, simNames)
+
+# Create list of file names of 'simsList' polygons(just the .shp file names)
+simShpFiles <- list.files("./msData/simsLists/Q1_32_C_simsList", pattern = glob2rx("*.shp"), full.names = TRUE)  
+# The list is sorted alphabetically, so simulation numbers are not in correct order. Correct for that.
+# Source for this process: http://stackoverflow.com/questions/10777367/how-can-i-read-the-files-in-a-directory-in-sorted-order-using-r
+# Split between the part that comes before the numeric index and the "index.shp"
+split <- strsplit(simShpFiles, "./msData/simsLists/Q1_32_C_simsList/Q1_32_C_cleaned_sim_")
+# Strip the "1.shp" etc. to get just the numeric values and turn the characters to numeric type
+split <- as.numeric(sapply(split, function(x) x <- sub(".shp", "", x[2])))
+
+# Sort by numeric order
+simShpFiles <- simShpFiles[order(split)]
+simLayer <- basename(simShpFiles)
+simLayer <- file_path_sans_ext(simLayer)
+
+# Create list to store the distances of the buffers
+bufferDists <- seq(from = 0.01, to = 0.20, by = 0.01)
+
+# Create dataframe for storing results from bufferTesting
+bufferDF <- data.frame(matrix(ncol = length(bufferDists), nrow = length(simShpFiles)))
+colnames(bufferDF) <- paste0("b_", c(1:20), "cm")
+rownames(bufferDF) <- simLayer
+
+head(bufferDF)
+
+# Buffering
+bufferTesting <- function(simFile) {
+    # Get the layer name for the simFile
+    simLayerName <- basename(simFile)
+    simLayerName <- file_path_sans_ext(simLayerName)
+    
+    # Read in the shapefile
+    plotTest <- readOGR(simFile, layer = simLayerName)
+
+    # Get the bounding box of the plot
+    bboxPolygon <- as(extent(plotTest), "SpatialPolygons")
+
+    # Get the @data for plotTest
+    polyData <- plotTest@data
+
+    # Buffer each polygon
+    buffTest <- lapply(1:length(bufferDists), function(x) {
+        gBuffer(plotTest, width = bufferDists[x], byid = TRUE)
+    })
+
+    # Clip buffers to the bounding box of the plot
+    buffClipped <- lapply(1:length(buffTest), function(x) {
+        gIntersection(bboxPolygon, buffTest[[x]], byid = TRUE)
+    })
+
+    # Get list of polygons
+    listOfPolys <- lapply(1:length(buffClipped), function(x) {
+        lapply(slot(buffClipped[[x]], "polygons"), function(x) SpatialPolygons(list(x)))
+    })
+    
+    # Get character list of polygon IDs
+    polyIDs <- lapply(1:length(listOfPolys), function(x) {
+        sapply(listOfPolys[[x]], function(x) slot(slot(x, "polygons")[[1]], "ID"))
+    })
+    
+    # Get the buffer rings (i.e., just the buffer ring and not the )
+    # First, create a new list to be able to add plotTest as the first object (needed for splitting out the first ring)
+    buffListFull <- vector("list", length(buffClipped)+1)
+    buffListFull <- c(plotTest, buffClipped)
+    diffTest <- lapply(2:length(buffListFull), function(x) {
+        lapply(1:length(buffListFull[[x]]), function(row) gDifference(buffListFull[[x]][row, ], buffListFull[[(x-1)]][row, ]))
+    })
+    
+    # Merge the @data to get an SPDF object
+    joined <- lapply(1:length(diffTest), function(x) {
+        SpatialPolygons(lapply(1:length(diffTest[[x]]), function(i) {
+            Pol <- slot(diffTest[[x]][[i]], "polygons")[[1]]
+            slot(Pol, "ID") <- polyIDs[[x]][i]
+            Pol
+        }))
+    })
+    joinedSPDF <- lapply(1:length(joined), function(x) {
+        SpatialPolygonsDataFrame(Sr = joined[[x]], data = polyData, FALSE)
+    })
+
+    # Get the intersection between buffer areas and original polygons
+    intersectTest <- lapply(1:length(joinedSPDF), function(x) {
+        raster::intersect(joinedSPDF[[x]], plotTest)
+    })
+    
+    # Calculate the proportion of overlapping buffers relative to the total buffer area and return the value
+    overlapProp <- lapply(1:length(intersectTest), function(x) {
+        (gArea(intersectTest[[x]]) / gArea(joinedSPDF[[x]]))
+    })
+    return(overlapProp)
+}
+
+# Run the bufferTesting function
+buffDF <- do.call("rbind", lapply(simShpFiles, function(j) bufferTesting(j)))
+colnames(buffDF) <- paste0("b_", c(1:20), "cm")
+rownames(buffDF) <- simLayer
+head(buffDF)
+
+setwd("C:\\Users\\darin\\Dropbox\\wd_R\\idaho_analysis\\working_data\\msData")
+getwd()
+saveRDS(buffDF, file="Q1_32_C_bufferDF.rds")
+write.csv(buffDF, file="Q1_32_C_bufferDF.csv")
+setwd("C:\\Users\\darin\\Dropbox\\wd_R\\idaho_analysis\\working_data")
+
+# Buffering
+bufferTesting <- function(simFile, simLayerName) {
+    # Read in the shapefile
+    plotTest <- readOGR(simFile, layer = simLayerName)
+    
+    # Get the bounding box for the plot
+    bboxPolygon <- as(extent(plotTest), 'SpatialPolygons')
+    
+    # Get the @data for plotTest
+    polyData <- plotTest@data
+    
+    # Buffer each polygon
+    buffTest <- gBuffer(plotTest, width = 0.01, byid = TRUE)
+    
+    # Clip buffers to the bounding box of the plot
+    buffClipped <- gIntersection(bboxPolygon, buffTest, byid = TRUE)
+    
+    # Get list of polygons
+    listOfPolys <- lapply(slot(buffClipped, "polygons"), function(x) SpatialPolygons(list(x)))
+    
+    # Get character list of polygon IDs
+    polyIDs <- sapply(listOfPolys, function(x) slot(slot(x, "polygons")[[1]], "ID"))
+    
+    # Test to see if they are the same length
+    if(length(unique(polyIDs)) == length(listOfPolys)) {
+        # Get buffer rings
+        diffTest <- lapply(1:length(buffClipped), function(row) gDifference(buffClipped[row, ], plotTest[row, ]))
+        
+        # Merge the @data to get an SPDF object
+        joined <- SpatialPolygons(lapply(1:length(diffTest), function(x) {
+            Pol <- slot(diffTest[[x]], "polygons")[[1]]
+            slot(Pol, "ID") <- polyIDs[x]
+            Pol
+        }))
+        joinedSPDF <- SpatialPolygonsDataFrame(Sr = joined, data = polyData, FALSE)
+        
+        # Get the intersections between buffer areas and original polygons
+        intersectTest <- raster::intersect(joinedSPDF, plotTest)
+
+        # Calculate proportion of overlapping buffers relative to total buffer area and return the value
+        overlapProp <- (gArea(intersectTest) / gArea(joinedSPDF)) 
+        overlapProp
+    } else {
+        print("Length not equal.")
+    }
+}
+over_con_sum <- lapply(1:length(simsList), function(x) {
+    inputPolys <- simsList[[x]]
+    preBufferOverlap(inputPolys)
+})
+
+buffOneRoundTest <- lapply(1:length(simShpFiles), function(x) {
+    inputShpFile <- simShpFiles[[x]]
+    inputShpLayer <- simLayer[[x]]
+    bufferTesting(inputShpFile, inputShpLayer)
+})
+
+
+# Old version before incorporating into a function, just for reference
+# plotTest <- readOGR("./msData/cleanedShapeFiles/Q1_32_C_cleaned.shp", layer = "Q1_32_C_cleaned")
 # plotTest <- simsList[[2]]
-plotTest <- plotTest[c(100, 105), ]
-plot(plotTest, add = TRUE)
-plantID <- factor(row.names(plotTest))
-polyData <- plotTest@data
-summary(polyData)
-
-# Buffer each polygon
-buffTest <- gBuffer(plotTest, width = 0.01, byid = TRUE)
-row.names(buffTest)
-plot(buffTest, add = TRUE)
-
-# Clip buffers to the bounding box of the plot
-buffClipped <- gIntersection(bboxPolygon, buffTest, byid = TRUE)
-plot(buffClipped)
-
-# Get list of polygons
-listOfPolys <- lapply(slot(buffClipped, "polygons"), function(x) SpatialPolygons(list(x)))
-# Get character list of polygon IDs
-polyIDs <- sapply(listOfPolys, function(x) slot(slot(x, "polygons")[[1]], "ID"))
-# names(listOfPolys) <- polyIDs
-# Test to see if they are the same length
-length(unique(polyIDs)) == length(listOfPolys)
-
-# Get buffer rings
-diffTest <- lapply(1:length(buffClipped), function(row) gDifference(buffClipped[row, ], plotTest[row, ]))
-#plot(diffTest[[1]], col = "skyblue")
-
-# Merge the @data to get a SpatialPolygonsDataFrame object
-joined <- SpatialPolygons(lapply(1:length(diffTest), function(x) {
-    Pol <- slot(diffTest[[x]], "polygons")[[1]]
-    slot(Pol, "ID") <- polyIDs[x]
-    Pol
-}))
-plot(joined, col = "skyblue")
-joinedSPDF <- SpatialPolygonsDataFrame(Sr = joined, data = polyData, FALSE)
-joinedSPDF@data
-plot(joinedSPDF, col = "skyblue")
-
-intersectTest <- raster::intersect(joinedSPDF, plotTest)
-plot(intersectTest)
-intersectTest[1, ]
-
-# Calculate proportion of overlapping buffers relative to total buffer area
-overlapProp <- (gArea(intersectTest) / gArea(joinedSPDF))  
+# plot(plotTest)
+# # Get the bounding box for the plot
+# bboxPolygon <- as(extent(plotTest), 'SpatialPolygons')
+# plot(bboxPolygon)
+# 
+# #plotTest <- plotTest[c(100, 105), ]
+# plot(plotTest, add = TRUE)
+# #plantID <- factor(row.names(plotTest))
+# polyData <- plotTest@data
+# summary(polyData)
+# 
+# # Buffer each polygon
+# buffTest <- gBuffer(plotTest, width = 0.01, byid = TRUE)
+# row.names(buffTest)
+# plot(buffTest, add = TRUE)
+# 
+# # Clip buffers to the bounding box of the plot
+# buffClipped <- gIntersection(bboxPolygon, buffTest, byid = TRUE)
+# plot(buffClipped)
+# 
+# # Get list of polygons
+# listOfPolys <- lapply(slot(buffClipped, "polygons"), function(x) SpatialPolygons(list(x)))
+# # Get character list of polygon IDs
+# polyIDs <- sapply(listOfPolys, function(x) slot(slot(x, "polygons")[[1]], "ID"))
+# # names(listOfPolys) <- polyIDs
+# # Test to see if they are the same length
+# length(unique(polyIDs)) == length(listOfPolys)
+# 
+# # Get buffer rings
+# diffTest <- lapply(1:length(buffClipped), function(row) gDifference(buffClipped[row, ], plotTest[row, ]))
+# #plot(diffTest[[1]], col = "skyblue")
+# 
+# # Merge the @data to get a SpatialPolygonsDataFrame object
+# joined <- SpatialPolygons(lapply(1:length(diffTest), function(x) {
+#     Pol <- slot(diffTest[[x]], "polygons")[[1]]
+#     slot(Pol, "ID") <- polyIDs[x]
+#     Pol
+# }))
+# plot(joined, col = "skyblue")
+# joinedSPDF <- SpatialPolygonsDataFrame(Sr = joined, data = polyData, FALSE)
+# joinedSPDF@data
+# plot(joinedSPDF, col = "skyblue")
+# 
+# intersectTest <- raster::intersect(joinedSPDF, plotTest)
+# plot(intersectTest)
+# intersectTest[1, ]
+# 
+# # Calculate proportion of overlapping buffers relative to total buffer area
+# overlapProp <- (gArea(intersectTest) / gArea(joinedSPDF))  
 
 
 
