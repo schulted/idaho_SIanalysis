@@ -1,0 +1,774 @@
+---
+title: "idaho_Intersect_polygon_pattern_analysis"
+author: "Darin Schulte"
+date: "September 12, 2016"
+output:
+  html_document: 
+    toc: true
+    toc_depth: 6
+---
+
+### Description   
+Data processing associated with investigating the application of point pattern analysis techniques on polygon data. Work is divided into three main components:   
+
+**Component**   |       **Purpose**     
+------------|---------------
+PPA         |   Traditional Point Pattern Analysis
+Polygon PPA |   Polygon based pair-correlation analysis    
+Aerial Polygon PPA   |   Polygon based analysis accounting for area of neighbors   
+
+### General terms and descriptions   
+**Concept**   |       **Description**     
+------------|---------------
+Pair Correlation Function $g(r)$       |   Based on object to object distances and describes the aggregation and regularity at a given radius $r$. A completely random pattern: $g(r) = 1$. Clustering: $g(r) > 1$. Regularity: $g(r) < 1$. $g(r)$ can take any value between $0$ and $infty$ and generally approaches $1$ as $r$ increases.
+Polygon PPA |   Polygon based pair-correlation analysis    
+Aerial Polygon PPA   |   Polygon based analysis accounting for area of neighbors      
+
+
+###Load Necessary Packages      
+```{r}
+# Spatial data and analysis packages
+library(rgdal)
+getGDALVersionInfo()
+library(gdalUtils)
+library(tools)
+library(raster)
+library(sp)
+library(shapefiles)
+library(reshape2)
+library(spatstat)
+library(maptools)
+library(rgeos)
+
+# Plotting packages
+library(ggplot2)
+library(grid)
+library(Rmisc)
+library(GGally)
+
+# General packages for data manipulation and statistics
+library(data.table)
+library(dplyr)
+library(stats)
+library(plyr)
+library(cleangeo)
+#library(car)
+#library(lme4)
+#library(nlme)
+
+```   
+
+<br/>   
+
+-----------    
+
+### Set working directory    
+Files were created in the *idaho_SIanalysis.RMD* file.   
+```{r}
+setwd("C:\\Users\\darin\\Dropbox\\wd_R\\idaho_analysis\\working_data")
+getwd()
+```   
+
+
+### Read in shapefile    
+```{r}
+# Read in the files
+polyFile <- readShapePoly("./msData/cleanedShapeFiles/Q20_56_C_cleaned.shp")
+# Remove duplicate SP_ID column from @data
+polyFile@data <- polyFile@data[, c(1, 3)]
+```  
+
+
+## Polygon-based pattern analysis     
+
+### Identify polygons that intersect the edge of the plot   
+The following is working with code from Ben Marwick as a base. See _https://github.com/benmarwick/Rocks-and-burials-at-Madjebebe/blob/master/code/Rocks-and-burials-at-MJB.Rmd_ for more details.      
+
+Create a polygon of the bounding box for the entire plot   
+```{r}
+# Create a polygon of the bounding box of the entire plot
+bboxPolygon <- as(extent(polyFile), 'SpatialPolygons')
+plot(bboxPolygon, add= TRUE)
+plot(polyFile)
+
+```      
+
+Convert the bounding box to a `SpatialLines` object   
+```{r}
+# Convert bboxPolys to a SpatialLines object 
+bboxAsLines <- as(bboxPolygon, "SpatialLines")
+bbLinesList <- unlist(bboxAsLines@lines[[1]])
+lineNames <- c("line1", "line2", "line3", "line4")
+# Create SpatialLines objects for the bbox lines
+bbLines_1 <- SpatialLines(list(Lines(list(Line(bbLinesList@Lines[[1]]@coords[1:2, ])), ID = lineNames[[1]])))
+bbLines_2 <- SpatialLines(list(Lines(list(Line(bbLinesList@Lines[[1]]@coords[2:3, ])), ID = lineNames[[2]])))
+bbLines_3 <- SpatialLines(list(Lines(list(Line(bbLinesList@Lines[[1]]@coords[3:4, ])), ID = lineNames[[3]])))
+bbLines_4 <- SpatialLines(list(Lines(list(Line(bbLinesList@Lines[[1]]@coords[4:5, ])), ID = lineNames[[4]])))
+# Join these into a single SpatialLines object
+bbLines <- bbLines_1
+bbLines <- spRbind(bbLines, bbLines_2)
+bbLines <- spRbind(bbLines, bbLines_3)
+bbLines <- spRbind(bbLines, bbLines_4)
+# Clean up old objects
+rm(bbLines_1, bbLines_2, bbLines_3, bbLines_4, lineNames)
+```   
+
+Create a list that stores the index of the `bbLines` object where an overlap with a given polygon occurs   
+```{r}
+# Get list of the bounding box edge index of overlap
+edgePolys <- sp::over(polyFile, bbLines, byid = TRUE)
+```   
+
+
+### Generate random points within the bounding box.     
+**Note** the number of points returned is approximately the value given. Better to generate extra points.    
+```{r}
+# Get the number of polygons in the shapefile
+numPoints <- length(polyFile) 
+rndPoints <- spsample(bboxPolygon, numPoints+100, type = "random")
+#rndPoints <- spsample(bboxPolygon, 200, type = "random")
+#plot(rndPoints)
+#plot(bboxPolygon, add = TRUE, border = "lightsteelblue4")
+```        
+
+### Randomly rotating and moving the polygons   
+
+Defines the process by which each plant polygon is randomly rotated and shifted to a point from the `rndPoints` object, or, if it touches the bounding box of the plot, it is rotated by a multiple of 90 degrees and assigned to a random location along one of the other edges. This creates a shapefile of the randomly shuffled polygons within the bounding box. This is repeated to generate a user defined number of shapefiles.     
+
+Code originally based on _https://github.com/benmarwick/Rocks-and-burials-at-Madjebebe/blob/master/code/Rocks-and-burials-at-MJB.Rmd_, however, recent updates to several packages (most notably the raster package) made the process much more streamlined.   
+```{r}
+# Create list of polygons sorted by size including whether or not they intersect the bounding box (they will be placed largest to smallest which may not be necessary if overlap is allowed)
+polys_sorted <- data.frame(id = integer(), intersectEdge = integer(), area = double()) 
+for (areas in 1:length(polyFile)) {
+    polys_sorted[areas, 1] <- polyFile@polygons[[areas]]@ID
+    polys_sorted[areas, 2] <- edgePolys[[areas]]
+    # May be better to use gArea, but since the exact area is not really the focus, it may not be necessary.
+    polys_sorted[areas, 3] <- polyFile@polygons[[areas]]@area
+}
+# Sort by descending area
+polys_sorted <- polys_sorted[order(-polys_sorted[,3]),]
+
+# The row names correspond to the polygon index (ID's start at 0 so row numbers are ID + 1)
+poly_index <- row.names(polys_sorted)
+poly_index <- as.numeric(poly_index)
+
+#poly_index <- polys_sorted[, 1]
+#poly_index <- as.numeric(poly_index)
+# Create list to store the output from each full run as a list of SpatialPolygonsDataFrames
+# The value supplied to 'length' will determine the number of random patterns generated
+#   Perry et al 2006 pg 62 note Diggle 2003 in saying 500 replicats seems appropriate for (alpha = 0.01) in
+#   tests of statistical significance
+simsList <- vector("list", length = 500)   # Change back to 500
+
+# Create a list of random angles (multiple of 90 degrees) by which to rotate the polygon (around its centroid).
+# Here, a list of length(number of polygons in the dataset) is created for the hypothetical case in which all polygons
+#   are touching an edge. This is never the case, but it makes sure that enough numbers are generated so that indexing 
+#   by 'plant' can be used to get the random rotation angle.
+# NOTE: rotates clockwise if 'by' is positive
+#edgePolyRotAngle <- sample(seq(0, 270, by = 90), size = length(polyFile), replace = TRUE)
+
+
+# The same process but for non-edge polygons. This creates a list of random angles from 0 to 359 of length(number of 
+#   polygons in the dataset) in the event that no polygons are touching an edge
+#rotateAngle <- sample(seq(0, 359, by = 1), size = length(polyFile), replace = TRUE)
+
+# Define an empty vector of length 2 to store the centroid coordinates for a given polygon
+centCoords <- vector(mode = "double", length = 2)
+# Function to calculate the centroid coordinates for a given polygon
+getCentCoords <- function(plantMoving) {
+    plantCentCoords <- slot(slot(slot(plantMoving, "polygons")[[1]], "Polygons")[[1]], "labpt")
+    return(plantCentCoords)
+}
+
+# Define empty vector of length 2 to store the random point coordinates which the plant will move to 
+rn <- vector(mode = "double", length = 2)
+
+# Define a list of one element (a vector of length 2) for storing offset values
+offsetValue <- list(vector(mode = "double", length = 2))
+
+# Define a function for calculating the offset values
+getOffsetVal <- function(coordVect, randomPoint) {
+    o_s_val <- coordVect - randomPoint
+    o_s_val <- list(-o_s_val)
+    return(o_s_val)
+}
+
+# Create an empty list to store results of checking for overlap
+# NOTE: Not run in the case where overlap is allowed
+overlapCheck = list()
+
+# Create an empty vector of length 1 to hold boolean value for crosses with other polygons
+# NOTE: Not run in the case where overlap is allowed
+noCrosses <- vector(mode = "logical", length = 1)
+
+for (i in 1:length(simsList)) {
+    # Track number of attempts to place a polygon (breaks at 1000 tries)
+    repTracker <- 1
+    repMax <- 1000
+    # Variable for query index
+    plant <- 1
+    plantMax <- length(poly_index) + 1
+
+    repeat {
+        # Get id of plants from the sorted list
+        plantToMoveID <- poly_index[plant]  
+        #plantToMoveID <- poly_index[1]
+        #poly_index[86]
+        #plot(polyFile[191, ])
+        #polyFile@polygons[[86]]@ID
+        # Select plant to rotate and move
+        plantToMove <- polyFile[plantToMoveID, ]
+        #polyFile[114, ]
+
+        # If the polygon is touching the bounding box,
+        #   1) rotate it by a multiple of 90 degrees, 
+        #   2) find the edge it intersects with, and 
+        #   3) move to a random position on the (different) appropriate bounding box edge
+        if (!is.na(polys_sorted[plant, 2])) {
+            # get the coordinates of the labpt, labpt, bbox also (centroid coords and bounding box)
+            centCoords <- getCentCoords(plantToMove)
+
+            # NOTE: Moved before the for loop to try and increase speed
+            # Get a random angle (multiple of 90 degrees) by which to rotate the polygon (around its center)
+            # NOTE: rotates clockwise if 'by' is positive
+            edgePolyRotAngle <- sample(seq(0, 270, by = 90), size = 1)   
+            
+            # Rotate the polygon
+            plantToMove <- elide(plantToMove, rotate = edgePolyRotAngle, center = centCoords)
+            
+            # Get the coordinates for plantToMove bbox (after rotation)
+            plantToMoveBBox <- plantToMove@bbox
+            
+            # Get the dimensions of the bbox (after rotation)
+            plantToMoveBBoxWidth <- abs(plantToMoveBBox[1,1] - plantToMoveBBox[1,2])  # in the x dimension
+            plantToMoveBBoxHeight <- abs(plantToMoveBBox[2,1] - plantToMoveBBox[2,2]) # in the y dimension
+            
+            # Get the shortest distance between the plantToMoveBBox and all edges
+            moveDistance <- gDistance(plantToMove, bbLines, byid = TRUE)
+
+            # Generate random value to assign to a point coordinate along an edge depending on the size of the polygon
+            randXOffset <- runif(1, (0.5 * plantToMoveBBoxWidth), (1 - 0.5 * plantToMoveBBoxWidth))
+            randYOffset <- runif(1, (0.5 * plantToMoveBBoxHeight), (1 - 0.5 * plantToMoveBBoxHeight))
+       
+            # Move the polygon to the appropriate edge depending on its rotation
+            if (polys_sorted[plant, 2] == 1) { # If polygon is initially touching the first side
+                if (edgePolyRotAngle == 0) {
+                    offsetCoord_x <- 0.0
+                    offsetCoord_y <- -(centCoords[2] - randYOffset)
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                    #gContains(bboxPolygon, plantMoved) == TRUE
+                } else if (edgePolyRotAngle == 90) {
+                    offsetCoord_x <- -(centCoords[1] - randXOffset)
+                    offsetCoord_y <- moveDistance[2]
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 180) {
+                    offsetCoord_x <- moveDistance[3]
+                    offsetCoord_y <- -(centCoords[2] - randYOffset)
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 270) {
+                    offsetCoord_x <- -(centCoords[1] - randXOffset)
+                    offsetCoord_y <- -(moveDistance[4])
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                }
+            } else if (polys_sorted[plant, 2] == 2) { # If polygon is initially touching the 2nd side
+                if (edgePolyRotAngle == 0) {
+                    offsetCoord_x <- -(centCoords[1] - randXOffset)
+                    offsetCoord_y <- 0.0
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 90) {
+                    offsetCoord_x <- moveDistance[3]
+                    offsetCoord_y <- -(centCoords[2] - randYOffset)
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 180) {
+                    offsetCoord_x <- -(centCoords[1] - randXOffset)
+                    offsetCoord_y <- -(moveDistance[4])
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 270) {
+                    offsetCoord_x <- -(moveDistance[1])
+                    offsetCoord_y <- -(centCoords[2] - randYOffset)
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                }
+            } else if (polys_sorted[plant, 2] == 3) { # If polygon is initially touching the 3rd side
+                if (edgePolyRotAngle == 0) {
+                    offsetCoord_x <- 0.0
+                    offsetCoord_y <- -(centCoords[2] - randYOffset)
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 90) {
+                    offsetCoord_x <- -(centCoords[1] - randXOffset)
+                    offsetCoord_y <- -(moveDistance[4])
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 180) {
+                    offsetCoord_x <- -(moveDistance[1])
+                    offsetCoord_y <- -(centCoords[2] - randYOffset)
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 270) {
+                    offsetCoord_x <- -(centCoords[1] - randXOffset)
+                    offsetCoord_y <- moveDistance[2]
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                }
+            } else if (polys_sorted[plant, 2] == 4) { # If polygon is initially touching the 4th side
+                if (edgePolyRotAngle == 0) {
+                    offsetCoord_x <- -(centCoords[1] - randXOffset)
+                    offsetCoord_y <- 0.0
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 90) {
+                    offsetCoord_x <- -(moveDistance[1])
+                    offsetCoord_y <- -(centCoords[2] - randYOffset)
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 180) {
+                    offsetCoord_x <- -(centCoords[1] - randXOffset)
+                    offsetCoord_y <- moveDistance[2]
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                } else if (edgePolyRotAngle == 270) {
+                    offsetCoord_x <- moveDistance[3]
+                    offsetCoord_y <- -(centCoords[2] - randYOffset)
+                    plantMoved <- elide(plantToMove, shift = c(offsetCoord_x, offsetCoord_y))
+                }
+            }
+        } else {
+            # get the coordinates of the labpt, labpt, bbox also (centroid coords and bounding box)
+            centCoords <- getCentCoords(plantToMove)
+            
+            # rotate the plant by a random angle
+            rotateAngle <- sample(seq(0, 359, by = 1), size = 1)
+            plantToMove <- elide(plantToMove, rotate = rotateAngle, center = centCoords) # NOTE: rotates clockwise if 'by' is positive
+            
+            # get a random point in the overall bounding box to move to
+            samplePoint <- sample(rndPoints, size = 1, replace = FALSE)
+            rn <- unname(samplePoint@coords)
+            #rn <- unname(rndPoints@coords[sample(1:length(rndPoints), 1),])
+            
+            # shift all vertices coordinates
+            offsetValue <- getOffsetVal(centCoords, rn)
+
+            # shift the spatialPolygons object
+            plantMoved <- elide(plantToMove, shift = c(offsetValue[[1]][1], offsetValue[[1]][2]))
+        }
+        
+        # Test to see whether the shifted polygon is within the plot bounding box (allowing for intersection)
+        if (gContains(bboxPolygon, plantMoved) == TRUE) {
+            if (plant == 1) {
+                plants_rnd <- plantMoved
+                plant <- plant + 1
+                #cat('\n', 'Moving on to plant ', plant)
+                #plot(plants_rnd)
+            } else {
+                # Check to see whether it overlaps with any other polygons
+                overlapCheck <- sp::over(plantMoved, plants_rnd, returnList = TRUE)
+                noCrosses <- (nrow(overlapCheck[[1]]) == 0) || is.null(nrow(overlapCheck[[1]]))
+
+                if (noCrosses == TRUE) {
+                    # Merge this SPDF object with plants_rnd
+                    plants_rnd <- rbind(plants_rnd, plantMoved)
+                    plant <- plant + 1
+                    #cat('\n', 'Moving on to plant ', plant)
+                    #plot(plants_rnd)
+                }
+            }
+        } else {
+            plant <- plant
+            #cat('\n', "Failed try. Staying at plant ", plant)
+            repTracker <- repTracker + 1
+            #cat('\n', 'Attempt number ', repTracker)
+        }
+        
+        # Check for number of tries
+        if (repTracker == repMax) {
+            cat('\n', 'Max reps reached. Exiting this attempt.')
+            break
+        }
+        if (plant == plantMax) {
+            #cat('\n', 'That should be all of the plants')
+            cat('\n', "#######  COMPLETING ROUND ###############", i)
+            simsList[[i]] <- plants_rnd
+            break
+        }
+    }  # End of repeat
+    
+}  # End of for loop
+
+plot(simsList[[100]])
+plot(simsList[[250]])
+#plot(bboxPolygon, add = TRUE)
+
+# Verify that each has the correct number of polygons
+testLength <- lapply(simsList, function(x) {length(x)})
+lapply(simsList, function(x) {length(x) == testLength})
+
+#___________________________________________________________________________
+# Write to file
+# Save simsList as an RData file for loading in the future
+saveRDS(simsList, "./msData/Q20_56_C_simsList.RDS")
+```     
+
+
+## Buffering and overlap calculations   
+
+```{r}
+# Read in the simsList list of SPDFs (created in the previous code chunk)
+simsList <- readRDS("./msData/Q20_56_C_simsList.RDS")
+
+# Read in the original shapefile (for which simsList patterns were generated)
+plotTest <- readOGR("./msData/cleanedShapeFiles/Q20_56_C_cleaned.shp", layer = "Q20_56_C_cleaned")
+plot(plotTest)
+
+# Append the SPDF for the original shapefile to simsList as the last element
+simsList[[501]] <- plotTest
+
+
+#____________________________________________________________________________________
+#NOT RUN IN INTERSECT_POLYGON_PATTERN_ANALYSIS since no initial overlap is allowed in simulations
+# # Define function for calculating initial overlap area (before buffering)
+# preBufferOverlap <- function(inputSPDF) {
+#     overlapTest <- gOverlaps(inputSPDF, byid = TRUE, returnDense = FALSE)
+#     containsTest <- gContainsProperly(inputSPDF, byid = TRUE, returnDense =FALSE)
+# 
+#     overlapAreas <- vector(mode = "list", length = length(inputSPDF))
+#     for (x in seq(along=overlapTest)) {
+#         if (!is.null(overlapTest[[x]])) {
+#             gi <- gIntersection(inputSPDF[overlapTest[[x]], ], inputSPDF[x, ])
+#             overlapAreas[x] <- ifelse(is.null(gi), 0, gArea(gi))
+#         }
+#     }
+#     
+#     containsAreas <- vector(mode = "list", length = length(inputSPDF))
+#     for (x in seq(along=containsTest)) {
+#         if (!is.null(containsTest[[x]])) {
+#             gi <- gIntersection(inputSPDF[containsTest[[x]], ], inputSPDF[x, ])
+#             containsAreas[x] <- ifelse(is.null(gi), 0, gArea(gi))
+#         }
+#     }
+#     
+#     overSum <- sum(unlist(overlapAreas))
+#     containSum <- sum(unlist(containsAreas))
+#     
+#     ocSum <- overSum + containSum
+#     # Return ocSum
+#     ocSum
+# }
+# 
+# # Run preBufferOverlap and store results in list
+# over_con_sum <- lapply(1:length(simsList), function(x) {
+#     inputPolys <- simsList[[x]]
+#     preBufferOverlap(inputPolys)
+# })
+# 
+# # Write to .rds and .csv files
+# saveRDS(over_con_sum, file="C:\\Users\\darin\\Dropbox\\wd_R\\idaho_analysis\\working_data\\msData\\Q20_56_C_initOverlap.rds")
+# write.csv(over_con_sum, file="C:\\Users\\darin\\Dropbox\\wd_R\\idaho_analysis\\working_data\\msData\\Q20_56_C_initOverlap.csv")
+
+#___________________________________________________________
+# Buffer testing
+# Buffer testing requires shapefiles to be read in with readOGR to create inner buffers. Write simsList to shapefiles and read in again with readOGR.
+#dir.create("./msData/simsLists")
+dir.create("./msData/simsLists/Q20_56_C_simsList")
+# Create list of file names of 'cleaned' polygons(just the .shp file names)
+clnShpFiles <- list.files("./msData/cleanedShapeFiles", pattern = glob2rx("*.shp"), full.names = TRUE)
+# Get only those names of plots that were simulated in simsList
+simFile <- clnShpFiles[[120]]
+simBaseName <- basename(simFile)
+simBaseName <- file_path_sans_ext(simBaseName)
+simIndex <- seq(from = 1, to = length(simsList), by = 1)
+simNames <- lapply(simIndex, function(x) paste("./msData/simsLists/Q20_56_C_simsList/", simBaseName, "_sim_", simIndex[x], sep=""))
+
+# Write simulations to shapefiles
+lapply(1:length(simsList), function(x) {
+    shpToWrite <- simsList[[x]]
+    shpToWriteName <- simNames[[x]]
+    writeSpatialShape(shpToWrite, shpToWriteName)
+})
+# Clean up environment variables
+# rm(clnShpFiles, simFile, simIndex, simNames)
+
+# Create list of file names of 'simsList' polygons(just the .shp file names)
+simShpFiles <- list.files("./msData/simsLists/Q20_56_C_simsList", pattern = glob2rx("*.shp"), full.names = TRUE)  
+# The list is sorted alphabetically, so simulation numbers are not in correct order. Correct for that.
+# Source for this process: http://stackoverflow.com/questions/10777367/how-can-i-read-the-files-in-a-directory-in-sorted-order-using-r
+# Split between the part that comes before the numeric index and the "index.shp"
+split <- strsplit(simShpFiles, "./msData/simsLists/Q20_56_C_simsList/Q20_56_C_cleaned_sim_")
+# Strip the "1.shp" etc. to get just the numeric values and turn the characters to numeric type
+split <- as.numeric(sapply(split, function(x) x <- sub(".shp", "", x[2])))
+
+# Sort by numeric order
+simShpFiles <- simShpFiles[order(split)]
+simLayer <- basename(simShpFiles)
+simLayer <- file_path_sans_ext(simLayer)
+
+# Create list to store the distances of the buffers
+#bufferDists <- seq(from = 0.01, to = 0.20, by = 0.01)
+bufferDists <- seq(from = 0.0, to = 0.20, by = 0.01)
+
+# Calculate the area version of intensity (lambda) for use in calculating wgtTest below
+plotIntensity <- gArea(plotTest)/gArea(bboxPolygon)
+
+# Buffering
+bufferTesting <- function(simFile) {
+    # Get the layer name for the simFile
+    simLayerName <- basename(simFile)
+    simLayerName <- file_path_sans_ext(simLayerName)
+    
+    # Read in the shapefile
+    plotTest <- readOGR(simFile, layer = simLayerName)
+    #plotTest <- readOGR(simShpFiles[[1]], layer = simLayer[[1]])
+
+    # Get the bounding box of the plot
+    bboxPolygon <- as(extent(plotTest), "SpatialPolygons")
+
+    # Get the @data for plotTest
+    polyData <- plotTest@data
+
+    # Buffer each polygon (returns list of SPDFs one for each buffer distance)
+    # Note: first buffer is set to 0.00 so it is the polygons without a buffer
+    buffTest <- lapply(1:length(bufferDists), function(x) {
+        gBuffer(plotTest, width = bufferDists[x], byid = TRUE)
+    })
+
+    # Get the buffer rings (i.e., just the buffer ring and not the original polygon (or previous rings))
+    diffTest <- lapply(2:length(buffTest), function(x) {
+        lapply(1:length(buffTest[[x]]), function(row) gDifference(buffTest[[x]][row, ], buffTest[[(x-1)]][row, ]))
+    })    
+    
+    # All of the IDs for individual rings are set to "1". Create list of ID values and assign them to the diffTest polys
+    polyIDs <- as.character(seq(from= 0, to = length(plotTest)-1, by = 1))
+    
+    # Merge the diffTest (list of, lists of SpatialPolygons) to get a list of SPDF objects
+    joined <- lapply(1:length(diffTest), function(x) {
+        SpatialPolygons(lapply(1:length(diffTest[[x]]), function(i) {
+            Pol <- slot(diffTest[[x]][[i]], "polygons")[[1]]
+            slot(Pol, "ID") <- polyIDs[i]
+            Pol
+        }))
+    })
+    joinedSPDF <- lapply(1:length(joined), function(x) {
+        SpatialPolygonsDataFrame(Sr = joined[[x]], data = polyData, FALSE)
+    })
+
+    # Clip buffers to the bounding box of the plot
+    buffClipped <- lapply(1:length(joinedSPDF), function(x) {
+        gIntersection(bboxPolygon, joinedSPDF[[x]], byid = TRUE, drop_lower_td = TRUE)
+    })
+
+    ## Left as reference for creating list of polygons and accessing ID slot
+    # listOfPolys_2 <- lapply(1:length(buffClipped_2), function(x) {
+    #     lapply(slot(buffClipped_2[[x]], "polygons"), function(x) SpatialPolygons(list(x)))
+    # })    
+    # polyIDs_2 <- lapply(1:length(listOfPolys_2), function(x) {
+    #     sapply(listOfPolys_2[[x]], function(x) slot(slot(x, "polygons")[[1]], "ID"))
+    # })
+    
+    # Get the area of the ring buffers
+    ringArea <- lapply(1:length(joinedSPDF), function(x) {
+        gArea(joinedSPDF[[x]], byid = TRUE)
+    })
+    ringAreaDF <- as.data.frame(ringArea)
+    head(ringAreaDF)
+    colnames(ringAreaDF) <- paste0("b_", c(1:20), "cm")
+    
+    # Get proportion of diffTest buffer rings that is / are within the bounding box
+    propRingIn <- lapply(1:length(joinedSPDF), function(x) {
+        sapply(1:length(joinedSPDF[[x]]), function(row) gArea(buffClipped[[x]][row, ])/gArea(joinedSPDF[[x]][row, ]))
+    })
+    propRingInDF <- as.data.frame(propRingIn)
+    
+    # Assign row and column names to buffDF
+    colnames(propRingInDF) <- paste0("b_", c(1:20), "cm")
+    # rownames(propRingInDF) <- row.names(joinedSPDF[[1]])
+    #head(buffDF)
+    # head(propRingInDF)
+    
+    # Get the ID's of the plotTest polygons that the given buffer overlaps. (Note, using gIntersection returns
+    # an ID for self intersection. Using gOverlaps returns NULL for self intersection only, and plotTest ID when
+    # the buffer overlaps with a plotTest polygon)
+    overlapsTest <- lapply(1:length(joinedSPDF), function(x) {
+         gOverlaps(plotTest, joinedSPDF[[x]], byid = TRUE, returnDense=FALSE)  
+    })
+    
+    # Get the intersection polygons between buffer rings and plotTest polygons 
+    intersectTest <- lapply(1:length(joinedSPDF), function(x) {
+        lapply(1:length(joinedSPDF[[x]]), function(j) {
+            if (!is.null(overlapsTest[[x]][[j]])) {
+                gIntersection(joinedSPDF[[x]][j, ], plotTest[overlapsTest[[x]][[j]], ], byid = TRUE)
+            }
+        })
+    })
+    
+    # Get the area of the intersections
+    intersectAreas <- lapply(1:length(intersectTest), function(x) {
+        lapply(1:length(intersectTest[[x]]), function(j) {
+            if (!is.null(intersectTest[[x]][[j]])) {
+                gArea(intersectTest[[x]][[j]])
+            }
+        })
+    })
+
+    # Convert intersectAreas to numeric data type(s) to deal with NULL values
+    intDF <- data.frame(sapply(intersectAreas, function(x) as.numeric(as.character(x))))
+
+    # Calculations for area weighted g(r)
+    wgtTest <- intDF / (plotIntensity * propRingInDF * ringAreaDF)
+    
+    # Means for each buffer ring distance
+    obsMeans <- (colSums(wgtTest, na.rm = TRUE))/nrow(wgtTest)
+    
+    return(obsMeans)
+}
+
+# Run the bufferTesting function (takes ~110 minutes for 501 shapefiles)
+buffDF <- do.call("rbind", lapply(simShpFiles, function(j) bufferTesting(j)))
+# # Write to .rds and .csv files
+# saveRDS(buffDF, file="C:\\Users\\darin\\Dropbox\\wd_R\\idaho_analysis\\working_data\\msData\\Q20_56_C_bufferDF.rds")
+# write.csv(buffDF, file="C:\\Users\\darin\\Dropbox\\wd_R\\idaho_analysis\\working_data\\msData\\Q20_56_C_bufferDF.csv")
+
+
+
+plot(x = bufferDists[2:21], y = simResults_Norm[3, ])
+plot(x = bufferDists[2:21], y = field_Norm)
+plot(x = bufferDists[2:21], y = simMeans)
+head(simResults_Norm)
+
+
+
+head(simResults)
+```   
+
+```{r}
+# Read in the results of the bufferTesting function (note: it is read in as a matrix)
+bufferDF <- readRDS("C:\\Users\\darin\\Dropbox\\wd_R\\idaho_analysis\\working_data\\msData\\Q20_56_C_bufferDF.rds")
+
+# Correction for polygon approach (Nuske et al. 2009)
+simResults <- bufferDF[1:500, ]
+simMeans <- colMeans(simResults)
+simResults_Norm <- simResults %*% diag(1/simMeans)
+
+# Apply normailization to field data NOTE: NEED TO VERIFY THIS IS THE CORRECT WAY TO DO THIS
+field_Norm <- bufferDF[501, ] %*% diag(1/simMeans)
+
+# Transpose and melt to long format for ggplot2
+simNorm_T <- t(simResults_Norm)
+head(simNorm_T)
+field_Norm_T <- t(field_Norm)
+
+# Coerce simNorm_T & field_Norm_T matrices to dataframes
+simNormDF_T <- as.data.frame(simNorm_T)
+simNormDF_T <- cbind(simNormDF_T, bufferDists[2:21])
+colnames(simNormDF_T) <- c(paste0("sim_", seq(from = 1, to = 500, by = 1), sep = ""), "buffer")
+fieldNormDF_T <- as.data.frame(field_Norm_T)
+fieldNormDF_T <- cbind(fieldNormDF_T, bufferDists[2:21])
+colnames(fieldNormDF_T) <- c("g_r_field", "buffer_field")
+
+# Convert to data.table
+setDT(simNormDF_T)
+meltedsimNorm <- melt(simNormDF_T, id.vars="buffer")
+setDT(fieldNormDF_T)
+
+# Write to .rds 
+saveRDS(meltedsimNorm, "./msData/Q20_56_C_meltedSimNorm.rds")
+saveRDS(fieldNormDF_T, "./msData/Q20_56_C_fieldNormDF_T.rds")
+
+# Read in .rds 
+meltedsimNorm <- readRDS("./msData/Q20_56_C_meltedSimNorm.rds")
+head(meltedsimNorm)
+tail(meltedsimNorm)
+is.data.table(meltedsimNorm)
+fieldNormDF_T <- readRDS("./msData/Q20_56_C_fieldNormDF_T.rds")
+head(fieldNormDF_T)
+is.data.table(fieldNormDF_T)
+
+# Change the types of column data
+glimpse(meltedsimNorm)
+names(meltedsimNorm) <- c("b_dist", "sim", "g_r")
+meltedsimNorm$g_r <- unlist(meltedsimNorm$g_r)
+meltedsimNorm[, b_dist:=as.character(b_dist)]
+meltedsimNorm[, sim:=as.character(sim)]
+# Alternate versions for controlling plot behavior for b_dist and buffer_field 
+meltedsimNorm_2 <- meltedsimNorm
+meltedsimNorm_2[, b_dist:=as.factor(b_dist)]
+meltedsimNorm_2[, sim:=as.factor(sim)]
+fieldNormDF_T_2 <- fieldNormDF_T
+
+# Set keys for data.table
+setkey(meltedsimNorm, b_dist)
+
+# get 12th largest and smallest values for CI plotting
+y_min <- meltedsimNorm[, .SD[g_r %in% head(sort(unique(g_r)), 13)], by = b_dist]
+y_minSorted <- y_min[order(b_dist, g_r)]
+y_minSorted[1:30, ]
+y_max <- meltedsimNorm[, .SD[g_r %in% tail(sort(unique(g_r)), 13)], by = b_dist]
+y_maxSorted <- y_max[order(b_dist, -g_r)]
+y_maxSorted[1:30, ]
+
+# Get every 13th element to set bounds for CI plots
+y_min <- y_minSorted[seq(13, NROW(y_minSorted), by = 13), ]
+y_max <- y_maxSorted[seq(13, NROW(y_maxSorted), by = 13), ]
+y_lims <- cbind(y_min, y_max)
+colnames(y_lims) <- c("b_dist_min", "sim_min", "lwr", "b_dist_max", "sim_max", "upr")
+
+# Calculate summaries of overlap by b_dist group
+meltSummary <- summarySE(meltedsimNorm_2, measurevar = "g_r", groupvars = "b_dist")
+glimpse(meltSummary)
+meltSummary <- cbind(meltSummary, y_lims$lwr, y_lims$upr)
+colnames(meltSummary) <- c("b_dist", "N", "g_r", "sd", "se", "ci", "lwr", "upr")
+
+
+# Test plots of g(r)
+ggplot(meltedsimNorm, aes(x=as.numeric(b_dist), y=as.numeric(g_r), group=sim)) + geom_line()
+
+cols <- c("Simulation mean" = "gray22", "Field data" = "skyblue")
+ggplot(meltSummary, aes(x=as.numeric(b_dist), y=g_r)) +
+    geom_line(size = 0.1, aes(colour = "Simulation mean")) + 
+    geom_ribbon(aes(x = as.numeric(b_dist), ymin = lwr, ymax = upr), alpha = 0.1) +
+    geom_line(data = fieldNormDF_T_2, size = 1, aes(as.numeric(buffer_field), g_r_field, colour = "Field data")) + 
+    scale_colour_manual(name = "Data Type", values = cols)
+
+# Density plot of overlaps by buffer distance
+overlapDens_title <- c("Overlap densities by buffer distance")
+overlapDens_plot <- ggplot(meltedsimNorm, aes(g_r, colour = b_dist)) +
+    geom_density() +
+    ggtitle(overlapDens_title) +
+    labs(x = "Proportion overlap", y = 'Density')
+overlapDens_plot
+
+# Correction for polygon approach (Nuske et al. 2009)
+simResults <- bufferDF[1:500, ]
+
+# Apply normailization to field data NOTE: NEED TO VERIFY THIS IS THE CORRECT WAY TO DO THIS
+field_data <- bufferDF[501, ]
+field_data <- as.data.frame(field_data)
+# Transpose and melt to long format for ggplot2
+simResults_T <- t(simResults)
+head(simResults_T)
+
+# Coerce simNorm_T & field_Norm_T matrices to dataframes
+simResultsDF_T <- as.data.frame(simResults_T)
+simResultsDF_T <- cbind(simResultsDF_T, bufferDists[2:21])
+colnames(simResultsDF_T) <- c(paste0("sim_", seq(from = 1, to = 500, by = 1), sep = ""), "buffer")
+fieldDataDF <- cbind(field_data, bufferDists[2:21])
+colnames(fieldDataDF) <- c("g_r_field", "buffer_field")
+
+# Convert to data.table
+setDT(simResultsDF_T)
+meltedsimResults <- melt(simResultsDF_T, id.vars="buffer")
+setDT(fieldDataDF)
+
+# # Write to .rds **********CHANGE OBJECT AND FILE NAMES***********
+# saveRDS(meltedsimNorm, "./msData/Q20_56_C_meltedSimNorm.rds")
+# saveRDS(fieldNormDF_T, "./msData/Q20_56_C_fieldNormDF_T.rds")
+
+# Change the types of column data
+glimpse(meltedsimResults)
+names(meltedsimResults) <- c("b_dist", "sim", "g_r")
+meltedsimResults$g_r <- unlist(meltedsimResults$g_r)
+meltedsimResults[, b_dist:=as.character(b_dist)]
+meltedsimResults[, sim:=as.character(sim)]
+glimpse(fieldDataDF)
+fieldDataDF$g_r_field <- unlist(fieldDataDF$g_r_field)
+fieldDataDF[, buffer_field:=as.character(buffer_field)]
+
+ggplot(meltedsimResults, aes(g_r, colour = b_dist)) +
+    geom_density()
+
+```   
+
+
+
+
