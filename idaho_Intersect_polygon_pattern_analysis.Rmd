@@ -702,7 +702,7 @@ y_min <- y_minSorted[seq(13, NROW(y_minSorted), by = 13), ]
 y_max <- y_maxSorted[seq(13, NROW(y_maxSorted), by = 13), ]
 y_lims <- cbind(y_min, y_max)
 colnames(y_lims) <- c("b_dist_min", "sim_min", "lwr", "b_dist_max", "sim_max", "upr")
-
+dd
 # Calculate summaries of overlap by b_dist group
 meltSummary <- summarySE(meltedsimNorm_2, measurevar = "g_r", groupvars = "b_dist")
 glimpse(meltSummary)
