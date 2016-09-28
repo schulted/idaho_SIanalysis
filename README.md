@@ -1,2 +1,2 @@
 # idaho_SIanalysis
-Shape complexity analysis for the Idaho dataset
+Shape complexity and area-based polygon pair-correlation analysis for the Idaho dataset
