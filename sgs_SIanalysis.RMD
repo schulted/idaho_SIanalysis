@@ -1,0 +1,301 @@
+---
+title: "Shortgrass Steppe Shape Complexity Analysis"
+author: "Darin Schulte"
+date: "October 2, 2016"
+output:
+  html_document: 
+    toc: true
+    toc_depth: 6
+---
+
+
+###Load Necessary Packages      
+ 
+```{r}
+# Spatial data and analysis packages
+library(rgdal)
+getGDALVersionInfo()
+library(gdalUtils)
+library(tools)
+library(raster)
+library(sp)
+library(shapefiles)
+library(reshape2)
+library(spatstat)
+library(maptools)
+library(cleangeo)
+library(rgeos)
+
+# Plotting packages
+library(ggplot2)
+library(grid)
+library(Rmisc)
+library(GGally)
+
+# General packages for data manipulation and statistics
+library(data.table)
+library(dtplyr)
+library(dplyr)
+library(stats)
+library(plyr)
+library(car)
+library(lme4)
+library(nlme)
+library(MASS)
+library(bbmle)
+```   
+
+<br/>   
+
+-----------    
+
+
+## General notes   
+
+### This rmd file is in the idaho data folder. The working directory cannot be changed as a result (even though this script deals with sgs data).   
+
+
+## Set the working directory   
+```{r}
+# Set working directory
+setwd("C:\\Users\\darin\\Dropbox\\wd_R\\idaho_analysis\\working_data")
+getwd()
+```      
+
+
+## Create list of shapefiles   
+List of shapefiles contains only the **cover** shapefiles (i.e., the polygon files not the point files).   
+```{r, eval = FALSE}
+# Create list of file names (just the .shp file names)
+sgsDirs <- list.dirs("C:/Users/darin/Dropbox/wd_R/sgs_spatial/sgs_data/shapefiles")
+# First item is the parent folder. Exclude that from shapefile directories list
+sgsDirs <- sgsDirs[-1]
+
+# Get paths to all shapefiles by iterating through the list of directories and extracting all shapefiles
+shpFiles <- lapply(sgsDirs, function(x) {list.files(x, pattern = glob2rx("*.shp"), full.names = TRUE)})
+# Get just the poly files (not the pnt files)
+polyFiles <- lapply(shpFiles, function(x) {grep(x, pattern = "poly_")})
+polysList <- lapply(1: length(shpFiles), function(x) {
+    shpFiles[x] <- shpFiles[[x]][polyFiles[[x]]]
+})
+# Exclude all *_24 plots due to inconsistent mapping of B. gracilis and B. dactyloides (see Chu et al 2009 for reason)
+polysList <- polysList[-c(3, 9, 15, 21)]
+
+# Extract base names (i.e., file names without full paths)
+baseNames <- lapply(polysList, function(x) {basename(x)})
+head(baseNames)
+
+# Remove .shp extension to get just the plot name and year
+baseNames <- lapply(baseNames, function(x) {file_path_sans_ext(x)})
+
+
+# Plot names used below in reassigning cleaned geometries to shapefiles
+cleanedNames <- lapply(baseNames, function(x) {paste("C:/Users/darin/Dropbox/wd_R/sgs_spatial/sgs_data/cleanedShapeFiles/", x, "_cleaned", sep="")})
+```      
+
+<br/>   
+ 
+---------------------   
+
+## Shape index processing   
+
+For each shapefile:   
+
+* Clean the geometries for all polygons    
+* Exclude the polygons that touch the bounding box for that plot    
+* Calculate the Shape Complexity Index for each polygon    
+* Append results to dataframe     
+
+
+### Cleaning the geometries   
+**NOTE**: Q2_36_C_cleaned required manual editing of one of the polygons in QGIS. After editing, the shapefile resulting from the following code chunk was replaced with the manually edited version.   
+```{r}
+# Cleaning the geometries
+######################################
+# NOTE: This only needs to be run once
+######################################
+# dir.create("C:/Users/darin/Dropbox/wd_R/sgs_spatial/sgs_data/cleanedShapeFiles")
+
+# Sometimes polygons have multiple assignments for Species. Keep all as without this, there are often very few B. grama. All multi-species
+#    assigments have BOGR as one of them
+keepSpecies <- c("Bouteloua gracilis", "BOGR/CAEL", "BOGR/BUDA", "BOGR/SIHY")
+
+# Define function to iterate through all shapefiles and clean goemetries. Write results to new shapefiles
+cleanGeoms <- lapply(1:length(polysList), function(x) {
+    lapply(1:length(polysList[[x]]), function(i) {
+        polyTemp <- readShapePoly(polysList[[x]][i])
+        # Get just Blue grama and multi-species assignments with BOGR as one 
+        polyTemp <- polyTemp[polyTemp@data$Species %in% keepSpecies, ]
+        #polyTemp <- polyTemp[b_grama, ]
+        # Inspect
+        report <- clgeo_CollectionReport(polyTemp)
+        # Clean
+        polyTemp.clean <- clgeo_Clean(polyTemp, strategy = "BUFFER") 
+        # Get @data for SP_ID, SP_ID_1, and Species
+        polyTemp.clean@data <- polyTemp.clean@data[, 1:3] 
+        # Write out new shapefile representing cleaned geometries for B. gracilis only
+        writeSpatialShape(polyTemp.clean, cleanedNames[[x]][i])
+    })
+})
+# rm(cleanGeoms)
+```   
+
+### Exclude polygons touching bounding box   
+```{r}
+######################################
+# NOTE: This only needs to be run once
+######################################
+#dir.create("C:/Users/darin/Dropbox/wd_R/sgs_spatial/sgs_data/nonEdgePolys")
+
+# Create list of file names of 'cleaned' polygons(just the .shp file names)
+clnShpFiles <- list.files("C:/Users/darin/Dropbox/wd_R/sgs_spatial/sgs_data/cleanedShapeFiles", pattern = glob2rx("*.shp"), full.names = TRUE)
+
+# Iterate through all shapefiles to test for intersection with bounding box
+lapply(clnShpFiles, function(x) {
+    shpToSPDF <- readShapePoly(x)
+    # Create SpatialPolygons object out of bounding box for the plot
+    bboxPolygon <- as(extent(shpToSPDF), "SpatialPolygons")
+    # Test for intersection with bounding box
+    edgePolysTest <- gContainsProperly(bboxPolygon, shpToSPDF, byid = TRUE)
+    # Get only those polygons that do not intersect the bbox and save to shapefile
+    spdf_edgeRmv <- shpToSPDF[c(edgePolysTest), ]
+    # Correct for extra @data columns being generated (calling writeShapePoly still generates an extra SP_ID column below)
+    spdf_edgeRmv@data <- spdf_edgeRmv@data[, 2:4]
+    colnames(spdf_edgeRmv@data) <- c("SP_ID", "SP_ID_1", "Species")
+    # Create new file names
+    shpBaseName <- basename(x)
+    shpBaseName <- file_path_sans_ext(shpBaseName)
+    edgeRmvNames <- paste("C:/Users/darin/Dropbox/wd_R/sgs_spatial/sgs_data/nonEdgePolys/", shpBaseName, "_edgeRmv", sep="")
+    # Write to shapefiles
+    writeSpatialShape(spdf_edgeRmv, edgeRmvNames)
+})
+```   
+
+### Calculating Shape Complexity     
+NOTE: This step only needs to be run once. Shapefiles are created for each plot and contain the shape complexity index in their respective data fields.   
+```{r}
+# dir.create("C:/Users/darin/Dropbox/wd_R/sgs_spatial/sgs_data/sciPolys")
+
+# Create list of file names of 'non-edge' polygons (created in previous code chunk)
+noEdgeShpFiles <- list.files("C:/Users/darin/Dropbox/wd_R/sgs_spatial/sgs_data/nonEdgePolys", pattern = glob2rx("*.shp"), full.names = TRUE)
+
+# Iterate through all shapefiles and calculate area, perimeter and shape complexity index for all polygons
+lapply(noEdgeShpFiles, function(x) {
+    shpToSPDF <- readShapePoly(x)
+    shpBaseName <- basename(x)
+    shpBaseName <- file_path_sans_ext(shpBaseName)
+    sciNames <- paste("C:/Users/darin/Dropbox/wd_R/sgs_spatial/sgs_data/sciPolys/", shpBaseName, "_sci", sep="")
+    # Keep only ID and Species name from @data fields
+    shpToSPDF@data <- shpToSPDF@data[, 2:4]
+    colnames(shpToSPDF@data) <- c("SP_ID", "SP_ID_1", "Species")
+    
+    # Calculate area of each polygon and append 'area' column to @data
+    shpToSPDF$area <- gArea(shpToSPDF, byid = TRUE)
+    # Calculate perimeter of each polygon and append 'perimeter' column to @data
+    shpToSPDF$perimeter <- gLength(shpToSPDF, byid = TRUE)
+    
+    # Calculate shape complexity index and append 'sci' column to @data
+    shpToSPDF$sci <- shpToSPDF$perimeter/(2*pi*(sqrt(shpToSPDF$area/pi)))
+    
+    # Write out to shapefile
+    writeSpatialShape(shpToSPDF, sciNames)
+})
+```   
+
+### Gather shape complexity index values from all shapefiles   
+```{r}
+# Create list of file names for shapefiles with 'sci' fields
+sciPolys <- list.files("C:/Users/darin/Dropbox/wd_R/sgs_spatial/sgs_data/sciPolys", pattern = glob2rx("*.shp"), full.names=TRUE)
+
+# Empty dataframe 
+sciDF <- data.frame(matrix(ncol = 10, nrow = 30000))
+colnames(sciDF) <- c("treatment", "plot", "year", "SP_ID", "SP_ID_1", "SP_ID_2", "Species", "area", "perimeter", "sci")
+
+# Iterate through all shapefiles and store 'sci' values in a dataframe
+sciDF <- do.call("rbind", lapply(sciPolys, function(x) {
+    shpToSPDF <- readShapePoly(x)
+    sciData <- shpToSPDF@data
+    shpBaseName <- basename(x)
+    shpBaseName <- file_path_sans_ext(shpBaseName)
+    split <- strsplit(shpBaseName, "poly_")
+    split <- strsplit(split[[1]][2], "[_]")
+    split <- do.call(rbind.data.frame, split)
+    split <- split[,1:3]
+    sciTemp <- cbind(split, sciData)
+    colnames(sciTemp) <- c("treatment", "plot", "year", "SP_ID", "SP_ID_1", "SP_ID_2", "Species", "area", "perimeter", "sci")
+    return(sciTemp)
+}))
+# # Write results to files
+# saveRDS(sciDF, file="C:/Users/darin/Dropbox/wd_R/sgs_spatial/sgs_data/sgs_shapeComplexity.rds")
+# write.csv(sciDF, file="C:/Users/darin/Dropbox/wd_R/sgs_spatial/sgs_data/sgs_shapeComplexity.csv")
+```      
+
+### Shape complexity analysis   
+```{r}
+# Read in Shape Complexity data
+sci_DF <- readRDS("C:/Users/darin/Dropbox/wd_R/sgs_spatial/sgs_data/sgs_shapeComplexity.rds")
+
+# Read in weather data
+weather <- read.csv("C:/Users/darin/Dropbox/wd_R/sgs_spatial/sgs_data/daily_climate_data.csv")
+head(weather)
+# Melt to look at annual precip
+# Melt sci_DF for analysis
+sciMelt <- melt(sci_DF, id = c("treatment", "plot", "year"), measure.vars = "sci")
+# Subset sciMelt to exclude the arbitrary square polygons
+sciNoSquares <- sciMelt[sciMelt$value > 1.128380, ]
+head(sciNoSquares)
+head(sciMelt)
+tail(sciMelt)
+glimpse(sciMelt)
+sciTRASH <- melt(sci_DF, id = c("treatment", "year"), measure.vars = "sci")
+head(sciTRASH)
+# Plot sci values for each treatment, grouped by plot, as a function of year
+sciSmoothed_plot <- ggplot(sciNoSquares[sciNoSquares$treatment == "unun", ], aes(x = as.numeric(year), y = value, color = plot, group = plot)) +
+    geom_smooth() +
+    ggtitle("Shape Complexity Index Timeseries") +
+    labs(x = "Year Index", y = "Shape Complexity Index") #+
+    #facet_wrap(~treatment)
+sciSmoothed_plot
+
+# Density plots of sci by treatment group
+sciDensity_title <- c("Shape complexity density by plot and grazing treatment")
+sciDensity_plot <- ggplot(sciNoSquares[sciNoSquares$treatment == "unun", ], aes(value, colour = year, group = year)) +
+    geom_density() +
+    ggtitle(sciDensity_title) +
+    labs(x = "Shape Complexity Index Value", y = "Density") +
+    facet_wrap(~plot)
+sciDensity_plot
+
+# ln Transformed Density plots of sci by treatment group
+sciTransfDens_plot <- ggplot(sciNoSquares, aes(value, colour = plot, group = plot)) +
+    geom_density() +
+    scale_x_continuous(trans = "logit") +
+    ggtitle("Shape Complexity Index by Plot and Grazing Treatment") +
+    labs(x = "Transformed Shape Complexity Index", y = "Density (%)") +
+    facet_wrap(~treatment)
+sciTransfDens_plot
+
+sciDensityByYear_plot <- ggplot(sciMelt) +
+    geom_density(aes(x = value, y = ..density.., colour = treatment, group = year)) +
+    ggtitle("Shape Complexity Density by Year and Treatment") +
+    labs(x = "Shape Complexity Index Value", y = "Density (%)") +
+    facet_wrap(~treatment)
+sciDensityByYear_plot
+
+# Violin plots
+sciViolinByTreatment_plot <- ggplot(sciMelt) +
+    geom_violin(aes(x = year, y = value, colour = treatment, group = year)) +
+    ggtitle("Shape Complexity by Year") +
+    labs(x = "Year", y = "Shape Complexity Index") +
+    facet_wrap(~treatment)
+sciViolinByTreatment_plot
+
+# Scatter plots
+sciScatterByTreatment_plot <- ggplot(sciMelt) +
+    geom_point(aes(x = year, y = value, colour = treatment, group = treatment)) +
+    ggtitle("Shape Complexity Inex by Year and Grazing Treatment") +
+    labs(x = "Year Index", y = "Shape Complexity Index") +
+    facet_wrap(~treatment)
+sciScatterByTreatment_plot
+```   
+
