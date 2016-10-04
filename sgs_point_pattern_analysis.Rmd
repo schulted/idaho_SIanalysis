@@ -1,0 +1,160 @@
+---
+title: "Shortgrass Steppe Point Pattern Analysis"
+author: "Darin Schulte"
+date: "October 2, 2016"
+output:
+  html_document: 
+    toc: true
+    toc_depth: 6
+---
+
+### Description   
+Data processing associated with investigating the application of point pattern analysis techniques on polygon data. Work is divided into three main components:   
+
+**Component**   |       **Purpose**     
+------------|---------------
+PPA         |   Traditional Point Pattern Analysis
+Polygon PPA |   Polygon based pair-correlation analysis    
+Aerial Polygon PPA   |   Polygon based analysis accounting for area of neighbors   
+
+### General terms and descriptions   
+**Concept**   |       **Description**     
+------------|---------------
+Pair Correlation Function $g(r)$       |   Based on object to object distances and describes the aggregation and regularity at a given radius $r$. A completely random pattern: $g(r) = 1$. Clustering: $g(r) > 1$. Regularity: $g(r) < 1$. $g(r)$ can take any value between $0$ and $infty$ and generally approaches $1$ as $r$ increases.
+Polygon PPA |   Polygon based pair-correlation analysis    
+Aerial Polygon PPA   |   Polygon based analysis accounting for area of neighbors      
+
+
+###Load Necessary Packages      
+```{r}
+# Spatial data and analysis packages
+library(rgdal)
+getGDALVersionInfo()
+library(gdalUtils)
+library(tools)
+library(raster)
+library(sp)
+library(shapefiles)
+library(reshape2)
+library(spatstat)
+library(maptools)
+library(rgeos)
+
+# Plotting packages
+library(ggplot2)
+library(grid)
+library(Rmisc)
+library(GGally)
+
+# General packages for data manipulation and statistics
+library(data.table)
+library(dplyr)
+library(stats)
+library(plyr)
+library(cleangeo)
+#library(car)
+#library(lme4)
+#library(nlme)
+```   
+
+<br/>   
+
+-----------    
+
+### Set working directory    
+Files were created in the *idaho_SIanalysis.RMD* file.   
+```{r}
+setwd("C:\\Users\\darin\\Dropbox\\wd_R\\idaho_analysis\\working_data")
+getwd()
+
+```   
+
+
+### Read in shapefile     
+Current version of the code will not perform randomization correctly if a polygon intersects more than one bounding box edge.    
+```{r}
+# Read in the files
+polyFile <- readShapePoly("C:/Users/darin/Dropbox/wd_R/sgs_spatial/sgs_data/cleanedShapeFiles/poly_unun_7_1998_cleaned.shp")
+plot(polyFile)
+
+# Remove duplicate SP_ID column from @data. NOTE: @data ID does not track with the SPDF Polygon ID's used below 
+polyFile@data <- polyFile@data[, c(2, 4)]
+
+```    
+
+### Convert polygons to points and create a ppp object    
+```{r}
+# Get centroids for the polygons
+#NOTE 1 pt is outside its polygon using this method. Here, points are not forced to be within polygons.
+centPoints <- gCentroid(polyFile, byid=TRUE)
+plot(centPoints, col="skyblue", add = TRUE)  
+
+# Create ppp object from centPoints
+centPoints <- as.ppp(centPoints)
+plot(centPoints)
+```   
+
+### PPA - Density plot     
+```{r}
+# Plot smoothed density
+plot(density(centPoints), main = "Density Plot")
+```   
+
+### PPA - Nearest Neighbor Distances         
+```{r}
+# Calculate distance from points to their nearest neighbors
+nnEst <- Gest(centPoints)
+nnEst
+plot(nnEst) # Values below G_pois suggest regularity
+
+# Get simulation envelopes for Gest (nrank sets the rank of the hi and low values)
+nnEst_env <- envelope(centPoints, Gest, nsim = 500, nrank = 13)
+plot(nnEst_env) # Values below G_pois suggest regularity
+
+#_________________________________
+# Mean Nearest Neighbor Distance
+meanNND <- nndist(centPoints)
+hist(meanNND)
+summary(meanNND)
+# Quick comparison to CSF of same intensity
+mnnd <- mean(meanNND)
+exp_nnd <- 0.5 / sqrt(centPoints$n/area(centPoints))
+mnnd/exp_nnd
+```      
+
+### PPA - Ripley's K & L-function            
+```{r}
+# Ripley's K-function
+ripK_Est <- Kest(centPoints)
+ripK_Est
+plot(ripK_Est) # Values below K_pois suggest regularity
+
+# Get simulation envelopes for Kest
+ripK_Est_env <- envelope(centPoints, Kest, nsim = 500, nrank = 13)
+plot(ripK_Est_env) # Values below K_theo suggest regularity
+
+# L-function: Transformation of K-function helpful for visualization
+l_Est <- Lest(centPoints)
+l_Est
+plot(l_Est) # Values below L_pois suggest regularity (same interpretation as K-function)
+
+# Get simulation envelopes for Lest (nrank sets the rank of the hi and low values)
+l_Est_env <- envelope(centPoints, Lest, nsim = 500, nrank = 13)
+plot(l_Est_env) # Values below L_theo suggest regularity (same interpretation as K-function)
+```      
+
+### PPA - Pair-Correlation function g(r)  
+Pair correlation function tells you whether there are more (above envelope) or fewer (below envelope) pairs of events at the given range of spacings than expected to occur by chance.   
+```{r}
+# Pair-correlation function
+pcf_Est <- pcf(centPoints)
+plot(pcf_Est)
+
+# Get simulation envelopes for PCF (nrank sets the rank of the hi and low values)
+pcf_Est_env <- envelope(centPoints, pcf, nsim = 500, nrank = 13)
+plot(pcf_Est_env) # Values below L_theo suggest regularity (same interpretation as K-function)
+# Change the range of y axis for better visualization
+plot(pcf_Est_env, ylim=c(0, 5))
+```      
+
+
